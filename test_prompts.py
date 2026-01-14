@@ -12,18 +12,18 @@ from dpp_gen import run_generation
 def load_model():
     MODEL_ID = "GSAI-ML/LLaDA-8B-Instruct"
 
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_compute_dtype=torch.bfloat16,
-        bnb_4bit_use_double_quant=True,
-        bnb_4bit_quant_type="nf4"
-    )
+    # bnb_config = BitsAndBytesConfig(
+    #     load_in_4bit=True,
+    #     bnb_4bit_compute_dtype=torch.bfloat16,
+    #     bnb_4bit_use_double_quant=True,
+    #     bnb_4bit_quant_type="nf4"
+    # )
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
     model = AutoModel.from_pretrained(
         MODEL_ID,
         trust_remote_code=True,
-        quantization_config=bnb_config,
+        # quantization_config=bnb_config,
         device_map="auto"
     )
 
