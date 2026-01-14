@@ -89,7 +89,7 @@ def run_gsm8k_benchmark(n_problems=20, configs=[]):
                 results[cfg['name']]['correct'] += 1
 
             # 2. Check Diversity
-            div = calculate_diversity_score(samples, eval_model)
+            div = calculate_diversity_score(eval_model, samples)
             results[cfg['name']]['diversity'].append(div)
 
             print(
@@ -114,19 +114,32 @@ if __name__ == "__main__":
     settings = [
         {
             "name": "Baseline (No DPP)",
-            "use_dpp": False,
-            "alpha": 0.0, "quality": 0.0, "pool": "mean", "proj": False, "target": "logits"
+            "alpha": 0.0, "quality": 0.0, "pool": "mean", "target": "logits", "temp": 1
         },
         {
-            "name": "DPP (Logits, Alpha=3.0, No Projection)",
-            "use_dpp": True,
-            "alpha": 3.0, "quality": 1.0, "pool": "mean", "proj": False, "target": "logits"
+            "name": "DPP (Logits, Alpha=3.0, mean)",
+            "alpha": 3.0, "quality": 1.0, "pool": "mean", "target": "logits", "temp": 1
         },
         {
-            "name": "DPP (Logits, Alpha=3.0, Projected)",
-            "use_dpp": True,
-            "alpha": 3.0, "quality": 1.0, "pool": "mean", "proj": True, "target": "logits"
+            "name": "DPP (Logits, Alpha=5.0, mean)",
+            "alpha": 5.0, "quality": 1.0, "pool": "mean", "target": "logits", "temp": 1
+        },
+        {
+            "name": "DPP (Logits, Alpha=3.0, max)",
+            "alpha": 3.0, "quality": 1.0, "pool": "max", "target": "logits", "temp": 1
+        },
+        {
+            "name": "DPP (Logits, Alpha=5.0, max)",
+            "alpha": 5.0, "quality": 1.0, "pool": "max", "target": "logits", "temp": 1
+        },
+        {
+            "name": "DPP (Embeddings, Alpha=3.0, max)",
+            "alpha": 3.0, "quality": 1.0, "pool": "max", "target": "embeddings", "temp": 1
+        },
+        {
+            "name": "DPP (Embeddings, Alpha=5.0, max)",
+            "alpha": 5.0, "quality": 1.0, "pool": "max", "target": "embeddings", "temp": 1
         },
     ]
 
-    run_gsm8k_benchmark(n_problems=20, configs=settings)
+    run_gsm8k_benchmark(n_problems=100, configs=settings)
