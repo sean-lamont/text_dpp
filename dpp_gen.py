@@ -298,116 +298,6 @@ def get_num_transfer_tokens(mask_index, steps):
         num_transfer_tokens[i, :remainder[i]] += 1
     return num_transfer_tokens
 
-
-# def apply_dpp_guidance(logits,
-#                        mask_index,
-#                        x,
-#                        alpha,
-#                        quality_scale,
-#                        entropy_threshold,
-#                        protected_tokens,
-#                        kernel_target="logits",
-#                        embedding_matrix=None,
-#                        strategy='joint',
-#                        pooling_method='max'):
-#     metadata = {
-#         "gate": 0.0,
-#         "entropy_map": torch.zeros(logits.shape[:2]).tolist(),
-#         "force_map": torch.zeros(logits.shape[:2]).tolist()
-#     }
-#
-#     if logits.shape[0] < 2: return logits, metadata
-#
-#     probs = torch.softmax(logits, dim=-1)
-#     log_probs = torch.log_softmax(logits, dim=-1)
-#     entropy_map = -torch.sum(probs * log_probs, dim=-1)
-#     metadata["entropy_map"] = entropy_map.detach().float().cpu()
-#
-#     pooled_entropy = entropy_map.mean(dim=1, keepdim=True)
-#     gate = torch.sigmoid((pooled_entropy - entropy_threshold) * 10.0)
-#     metadata["gate"] = gate.mean().item()
-#
-#     if gate.mean() < 0.05:
-#         return logits, metadata
-#
-#     with torch.enable_grad():
-#         logits_in = logits.detach().clone().requires_grad_(True)
-#         probs_in_ = torch.softmax(logits_in, dim=-1)
-#
-#         probs_in = torch.zeros_like(probs_in_).to(probs_in_.device)
-#         probs_in[mask_index] = probs_in_[mask_index]
-#         one_hot_tokens = F.one_hot(x[~mask_index], num_classes=probs_in.shape[-1])
-#         probs_in[~mask_index] = one_hot_tokens.to(dtype=probs_in.dtype)
-#
-#         if kernel_target == "embeddings" and embedding_matrix is not None:
-#             W = embedding_matrix.to(probs_in.device).detach()
-#             features = torch.matmul(probs_in, W)
-#         else:
-#             features = probs_in
-#
-#         # Pooling
-#         if pooling_method == "max":
-#             vecs = features.max(dim=1).values
-#         else:
-#             vecs = features.mean(dim=1)
-#
-#         norm_vec = F.normalize(vecs, p=2, dim=1)
-#         final_grad = torch.zeros_like(logits_in)
-#
-#         if strategy == "joint":
-#             K = torch.mm(norm_vec, norm_vec.t())
-#             identity = torch.eye(K.shape[0], device=K.device)
-#             jitter = 1e-4
-#
-#             # Quality Term
-#             max_conf = probs_in.max(dim=-1).values.mean(dim=1)
-#             quality_matrix = torch.outer(max_conf, max_conf)
-#             L = K * (1 + quality_scale * quality_matrix)
-#
-#             term1 = torch.logdet(L + jitter * identity)
-#             term2 = torch.logdet(L + identity + jitter * identity)
-#             loss = -(term1 - term2)
-#
-#             final_grad = torch.autograd.grad(loss, logits_in)[0]
-#
-#         elif strategy == "sequential":
-#             # todo sequential vs joint strategy option
-#             for k in range(1, logits.shape[0]):
-#                 sub_vecs = norm_vec[:k + 1]
-#                 K_sub = torch.mm(sub_vecs, sub_vecs.t())
-#                 identity_sub = torch.eye(k + 1, device=K_sub.device)
-#                 jitter = 1e-4
-#
-#                 sub_conf = probs_in.max(dim=-1).values.mean(dim=1)[:k + 1]
-#                 q_sub = torch.outer(sub_conf, sub_conf)
-#                 L_sub = K_sub * (1 + quality_scale * q_sub)
-#
-#                 term1 = torch.logdet(L_sub + jitter * identity_sub)
-#                 term2 = torch.logdet(L_sub + identity_sub + jitter * identity_sub)
-#                 loss = -(term1 - term2)
-#                 grads = torch.autograd.grad(loss, logits_in, retain_graph=True)[0]
-#                 final_grad[k] = grads[k]
-#
-#     if protected_tokens is not None:
-#         final_grad.index_fill_(2, protected_tokens, 0.0)
-#
-#     token_norms = torch.norm(final_grad, p=2, dim=-1, keepdim=True)
-#
-#     # take maximum norm over gradients in sequence, and normalise by that.
-#     # Other option is to take norm over each token and normalise (each token moves by alpha then, may not be desirable)
-#     # Or to scale gradient of whole sequence by E.g. frobenius norm
-#     max_norms = token_norms.max(dim=1, keepdim=True).values.clamp(min=1e-8)
-#
-#     grad_safe = torch.where(max_norms > 0, final_grad / max_norms, final_grad)
-#
-#     grad_final = grad_safe * gate.unsqueeze(-1)
-#
-#     update = alpha * grad_final
-#     metadata["force_map"] = torch.norm(update, p=2, dim=-1).detach().float().cpu()
-#
-#     return logits - update, metadata
-
-
 @torch.no_grad()
 def run_generation(model,
                    embedding_matrix,
@@ -417,10 +307,12 @@ def run_generation(model,
                    steps,
                    gen_length,
                    alpha,
-                   quality_score,
+                   quality,
                    entropy_thresh,
                    temperature,
-                   tokenizer):
+                   tokenizer,
+                   pool,
+                   target):
 
     messages = [{"role": "user", "content": prompt}]
     prompt_str = tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
@@ -464,13 +356,14 @@ def run_generation(model,
             gen_logits_guided, metadata = apply_dpp_guidance(
                 gen_logits,
                 alpha=curr_alpha,
-                quality_scale=quality_score,
+                quality_scale=quality,
                 entropy_threshold=entropy_thresh,
                 protected_tokens=protected_tokens,
-                kernel_target="logits",
+                kernel_target=target,
                 mask_index=mask_index[:, prompt_len:],
                 x=x[:, prompt_len:],
-                embedding_matrix=embedding_matrix
+                embedding_matrix=embedding_matrix,
+                pooling_method=pool
             )
 
             logits[:, prompt_len:, :] = gen_logits_guided
@@ -531,7 +424,7 @@ def run_generation(model,
     # Final Frame
     final_frame = {"step": steps, "alpha": 0.0, "gate": 0.0, "batches": []}
 
-    samples = tokenizer.batch_decode(x[:, prompt_len:])
+    samples = tokenizer.batch_decode(x[:, prompt_len:],skip_special_tokens=True)
 
     for b in range(batch_size):
         raw_ids = x[b, prompt_len:].tolist()

@@ -43,12 +43,15 @@ def load_model():
 
 
 if __name__ == "__main__":
-    PROMPT = "Describe the logic to prove that n*(n+1) is even. Do not use code."
+    # PROMPT = "Describe the logic to prove that n*(n+1) is even. Do not use code."
     # PROMPT = "Write a python function to check if a word is a palindrome"
+    PROMPT = "Write a python function to compute the fibonacci value of n"
     # PROMPT = "Write a haiku about a robot realizing it is alive."
     # PROMPT = "Explain what 'Time' is."
     # PROMPT = "Explain a metaphor for how neural networks learn."
     # PROMPT = "Write a python program to train a neural network"
+    # PROMPT = "Explain what a boxer is"
+    # PROMPT = "Write a python function to compute factorials"
 
     print(f"PROMPT: {PROMPT}\n")
 
@@ -56,12 +59,20 @@ if __name__ == "__main__":
     settings = [
         {
             "name": "Baseline (No DPP)",
-            "alpha": 0.0, "quality": 0.0, "pool": "max", "target": "logits"
+            "alpha": 0.0, "quality": 0.0, "pool": "max", "target": "logits", "temp": 1
         },
         # todo strategy + progressive
         {
-            "name": "DPP",
-            "alpha": 3.0, "quality": 1.0, "pool": "max", "target": "logits"
+            "name": "DPP alpha=3",
+            "alpha": 3.0, "quality": 1.0, "pool": "max", "target": "logits", "temp": 1
+        },
+        {
+            "name": "DPP alpha=5",
+            "alpha": 5.0, "quality": 1.0, "pool": "max", "target": "logits", "temp": 1
+        },
+        {
+            "name": "DPP alpha=10",
+            "alpha": 10.0, "quality": 1.0, "pool": "max", "target": "logits", "temp": 1
         },
     ]
 
@@ -71,7 +82,7 @@ if __name__ == "__main__":
         print(f"--- {cfg['name']} ---")
         start = time.time()
 
-        samples = run_generation(
+        _, samples = run_generation(
             prompt=PROMPT,
             model=model,
             mask_token_id=mask_token_id,
@@ -82,10 +93,17 @@ if __name__ == "__main__":
             alpha=cfg['alpha'],
             quality=cfg['quality'],
             pool=cfg['pool'],
-            target=cfg['target']
+            target=cfg['target'],
+            entropy_thresh=0.6,
+            tokenizer=tokenizer,
+            temperature=cfg['temp']
         )
 
         print(f"Time: {time.time() - start:.2f}s")
+        # print (samples)
+
         for i, s in enumerate(samples):
-            print(f"[{i + 1}] {s.strip().replace(chr(10), ' / ')}")
+            # print(f"[{i + 1}] {s.strip().replace(chr(10), ' / ')}")
+            print(f"[{i + 1}] {s}")
+
         print("")
