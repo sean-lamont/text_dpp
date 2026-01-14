@@ -44,8 +44,11 @@ def run_gsm8k_benchmark(n_problems=20, configs=[]):
 
     print(f"\n>>> STARTING BENCHMARK on {n_problems} Problems")
 
+    if n_problems == -1:
+        n_problems = len(dataset)
+
     for i in range(n_problems):
-        row = dataset[i + 10]
+        row = dataset[i]
         q = row['question']
         gold = extract_gold_num(row['answer'])
         if gold is None: continue
