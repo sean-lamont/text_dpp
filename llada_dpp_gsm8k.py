@@ -120,18 +120,6 @@ if __name__ == "__main__":
             "alpha": 0.0, "quality": 0.0, "pool": "mean", "target": "logits", "temp": 1
         },
         {
-            "name": "DPP (Logits, Alpha=3.0, mean)",
-            "alpha": 3.0, "quality": 1.0, "pool": "mean", "target": "logits", "temp": 1
-        },
-        {
-            "name": "DPP (Logits, Alpha=5.0, mean)",
-            "alpha": 5.0, "quality": 1.0, "pool": "mean", "target": "logits", "temp": 1
-        },
-        {
-            "name": "DPP (Logits, Alpha=10.0, mean)",
-            "alpha": 10.0, "quality": 1.0, "pool": "mean", "target": "logits", "temp": 1
-        },
-        {
             "name": "DPP (Logits, Alpha=3.0, max)",
             "alpha": 3.0, "quality": 1.0, "pool": "max", "target": "logits", "temp": 1
         },
@@ -144,28 +132,12 @@ if __name__ == "__main__":
             "alpha": 10.0, "quality": 1.0, "pool": "max", "target": "logits", "temp": 1
         },
         {
-            "name": "DPP (Embeddings, Alpha=3.0, max)",
-            "alpha": 3.0, "quality": 1.0, "pool": "max", "target": "embeddings", "temp": 1
+            "name": "DPP (Logits, Alpha=20.0, max)",
+            "alpha": 20.0, "quality": 1.0, "pool": "max", "target": "logits", "temp": 1
         },
         {
-            "name": "DPP (Embeddings, Alpha=5.0, max)",
-            "alpha": 5.0, "quality": 1.0, "pool": "max", "target": "embeddings", "temp": 1
-        },
-        {
-            "name": "DPP (Embeddings, Alpha=10.0, max)",
-            "alpha": 10.0, "quality": 1.0, "pool": "max", "target": "embeddings", "temp": 1
-        },
-        {
-            "name": "DPP (Embeddings, Alpha=3.0, mean)",
-            "alpha": 3.0, "quality": 1.0, "pool": "mean", "target": "embeddings", "temp": 1
-        },
-        {
-            "name": "DPP (Embeddings, Alpha=5.0, mean)",
-            "alpha": 5.0, "quality": 1.0, "pool": "mean", "target": "embeddings", "temp": 1
-        },
-        {
-            "name": "DPP (Embeddings, Alpha=10.0, mean)",
-            "alpha": 10.0, "quality": 1.0, "pool": "mean", "target": "embeddings", "temp": 1
+            "name": "DPP (Logits, Alpha=20.0, max)",
+            "alpha": 100.0, "quality": 1.0, "pool": "max", "target": "logits", "temp": 1
         },
 
     ]
