@@ -33,7 +33,7 @@ def compute_entropy_metadata(logits, entropy_threshold):
     return metadata
 
 
-def extract_feature_vector_phasor(logit_k, mask_k, x_k, seq_len_scale=64):
+def extract_feature_vector_phasor(logit_k, mask_k, x_k, embedding_matrix, kernel_target, pooling_method,  seq_len_scale=64):
     """
     Encodes position as phase angle.
     Doubles feature dim from [Vocab] to [2 * Vocab].
