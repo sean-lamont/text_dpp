@@ -169,7 +169,7 @@ def _step_sequential_logdet(logit_k, norm_vec_k, quality_k, previous_vecs, previ
 
     q_sub = torch.outer(all_quals, all_quals)
     # L_sub = K_sub * (1 + quality_scale * q_sub)
-    L_sub = K_sub * (1 + quality_scale * q_sub)
+    L_sub = K_sub * (quality_scale * q_sub)
 
     term1 = torch.logdet(L_sub + jitter * identity)
     term2 = torch.logdet(L_sub + identity + jitter * identity)
