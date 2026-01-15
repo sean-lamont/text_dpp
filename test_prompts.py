@@ -65,7 +65,7 @@ if __name__ == "__main__":
         # todo strategy + progressive
     ]
 
-    settings.extend([{"name": f"alpha: {a}", "alpha": a, "quality": 0.1, "temp": 1, "pool": "max", "target": "logits"} for a in [2, 4, 8, 16, 32, 256, 512, 2048, 8192, 32968]])
+    settings.extend([{"name": f"alpha: {a}", "alpha": a, "quality": 1.0, "temp": 1, "pool": "max", "target": "logits"} for a in [2, 4, 8, 16, 32, 256, 512, 2048, 8192, 32968]])
 
     model, tokenizer, embedding_matrix, mask_token_id = load_model()
 
