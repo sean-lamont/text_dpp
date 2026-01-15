@@ -64,7 +64,9 @@ def extract_feature_vector_phasor(logit_k, mask_k, x_k, embedding_matrix, kernel
 
     phasor_vec = torch.cat([real_part, imag_part], dim=-1)
 
-    return F.normalize(phasor_vec, p=2, dim=1), max_vals[mask_k].mean(dim=1)
+    quality = probs_in[mask_k].max(dim=-1).values.mean(dim=1)
+
+    return F.normalize(phasor_vec, p=2, dim=1), quality
 
 
 def extract_feature_vector(logit_k, mask_k, x_k, embedding_matrix, kernel_target, pooling_method):
