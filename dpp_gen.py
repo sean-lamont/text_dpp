@@ -33,6 +33,40 @@ def compute_entropy_metadata(logits, entropy_threshold):
     return metadata
 
 
+def extract_feature_vector_phasor(logit_k, mask_k, x_k, seq_len_scale=64):
+    """
+    Encodes position as phase angle.
+    Doubles feature dim from [Vocab] to [2 * Vocab].
+    """
+    if logit_k.dim() == 2: logit_k = logit_k.unsqueeze(0)
+    if mask_k.dim() == 1: mask_k = mask_k.unsqueeze(0)
+    if x_k.dim() == 1: x_k = x_k.unsqueeze(0)
+
+    probs_in_ = torch.softmax(logit_k, dim=-1)
+    probs_in = torch.zeros_like(probs_in_)
+    probs_in[mask_k] = probs_in_[mask_k]
+    if (~mask_k).any():
+        one_hot = F.one_hot(x_k[~mask_k], num_classes=probs_in.shape[-1])
+        probs_in[~mask_k] = one_hot.to(dtype=probs_in.dtype)
+
+    max_vals, max_indices = probs_in.max(dim=1)
+
+    # We map sequence length [0, seq_len] to angle [0, pi/2]
+    # This ensures 0 and End are orthogonal, but not anti-parallel (which would be -1 sim)
+    omega = (torch.pi / 2.0) / seq_len_scale
+    angles = max_indices.float() * omega  # [Batch, Vocab]
+
+    # The magnitude is the confidence (max_vals)
+    # The direction is the token identity
+    # The phase is the position
+    real_part = max_vals * torch.cos(angles)
+    imag_part = max_vals * torch.sin(angles)
+
+    phasor_vec = torch.cat([real_part, imag_part], dim=-1)
+
+    return F.normalize(phasor_vec, p=2, dim=1), max_vals.mean(dim=1)
+
+
 def extract_feature_vector(logit_k, mask_k, x_k, embedding_matrix, kernel_target, pooling_method):
     """
     Extracts the feature vector and quality score for a single batch item
@@ -150,7 +184,6 @@ def apply_dpp_guidance(
 
     if logits.shape[0] < 2: return logits, metadata
 
-    # 1. Metadata
     meta = compute_entropy_metadata(logits, entropy_threshold)
     metadata["gate"] = meta["gate"]
     metadata["entropy_map"] = meta["entropy_map"]
@@ -197,7 +230,7 @@ def apply_dpp_guidance(
                 # A. Gradient Calculation
                 logit_k = logits[k].unsqueeze(0).detach().clone().requires_grad_(True)
 
-                norm_vec_k, qual_k = extract_feature_vector(
+                norm_vec_k, qual_k = extract_feature_vector_phasor(
                     logit_k, mask_index[k].unsqueeze(0), x[k].unsqueeze(0),
                     embedding_matrix, kernel_target, pooling_method
                 )
@@ -227,7 +260,7 @@ def apply_dpp_guidance(
                 if progressive:
                     with torch.no_grad():
                         # Re-extract from UPDATED logits
-                        norm_vec_new, qual_new = extract_feature_vector(
+                        norm_vec_new, qual_new = extract_feature_vector_phasor(
                             current_logits[k].unsqueeze(0),
                             mask_index[k].unsqueeze(0),
                             x[k].unsqueeze(0),
