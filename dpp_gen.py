@@ -154,7 +154,8 @@ def _step_gram_schmidt(logit_k, norm_vec_k, quality_k, basis_vectors, quality_sc
         v_perp = v_perp - proj
 
     resid_norm = torch.norm(v_perp, p=2)
-    loss = -1.0 * (resid_norm ** 2) * (1.0 + quality_scale * quality_k)
+    loss = -1.0 * (resid_norm ** 2) * (quality_scale * quality_k)
+    # loss = -1.0 * (resid_norm ** 2) * (1.0 + quality_scale * quality_k)
     return torch.autograd.grad(loss, logit_k)[0]
 
 
@@ -167,6 +168,7 @@ def _step_sequential_logdet(logit_k, norm_vec_k, quality_k, previous_vecs, previ
     jitter = 1e-4
 
     q_sub = torch.outer(all_quals, all_quals)
+    # L_sub = K_sub * (1 + quality_scale * q_sub)
     L_sub = K_sub * (1 + quality_scale * q_sub)
 
     term1 = torch.logdet(L_sub + jitter * identity)
