@@ -33,7 +33,8 @@ def compute_entropy_metadata(logits, entropy_threshold):
     return metadata
 
 
-def extract_feature_vector_phasor(logit_k, mask_k, x_k, embedding_matrix, kernel_target, pooling_method,  seq_len_scale=64):
+def extract_feature_vector_phasor(logit_k, mask_k, x_k, embedding_matrix, kernel_target, pooling_method,
+                                  seq_len_scale=64):
     """
     Encodes position as phase angle.
     Doubles feature dim from [Vocab] to [2 * Vocab].
@@ -64,7 +65,13 @@ def extract_feature_vector_phasor(logit_k, mask_k, x_k, embedding_matrix, kernel
 
     phasor_vec = torch.cat([real_part, imag_part], dim=-1)
 
-    quality = probs_in[mask_k].max(dim=-1).values.mean(dim=1)
+    # quality mean max value, only over mask tokens
+    all_max_vals = probs_in.max(dim=-1).values
+    masked_max_vals = all_max_vals * mask_k.float()
+    num_masked = mask_k.sum(dim=1).clamp(min=1.0)
+    quality = masked_max_vals.sum(dim=1) / num_masked
+
+    # quality = probs_in.max(dim=-1).values.mean(dim=1)
 
     return F.normalize(phasor_vec, p=2, dim=1), quality
 
@@ -103,8 +110,12 @@ def extract_feature_vector(logit_k, mask_k, x_k, embedding_matrix, kernel_target
 
     norm_vec = F.normalize(vecs, p=2, dim=1)
 
-    # Quality Score (Mean max confidence)
-    quality = probs_in[mask_k].max(dim=-1).values.mean(dim=1)
+    all_max_vals = probs_in.max(dim=-1).values
+    masked_max_vals = all_max_vals * mask_k.float()
+    num_masked = mask_k.sum(dim=1).clamp(min=1.0)
+    quality = masked_max_vals.sum(dim=1) / num_masked
+
+    # quality = probs_in.max(dim=-1).values.mean(dim=1)
 
     return norm_vec, quality
 
@@ -133,6 +144,7 @@ def _normalize_gradient(grad, protected_tokens=None):
 
     grad_safe = torch.where(max_norms > 0, grad / max_norms, grad)
     return grad_safe
+
 
 def _step_gram_schmidt(logit_k, norm_vec_k, quality_k, basis_vectors, quality_scale):
     v_perp = norm_vec_k.clone()
@@ -333,6 +345,7 @@ def get_num_transfer_tokens(mask_index, steps):
         num_transfer_tokens[i, :remainder[i]] += 1
     return num_transfer_tokens
 
+
 @torch.no_grad()
 def run_generation(model,
                    embedding_matrix,
@@ -348,7 +361,6 @@ def run_generation(model,
                    tokenizer,
                    pool,
                    target):
-
     messages = [{"role": "user", "content": prompt}]
     prompt_str = tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
 
@@ -459,7 +471,7 @@ def run_generation(model,
     # Final Frame
     final_frame = {"step": steps, "alpha": 0.0, "gate": 0.0, "batches": []}
 
-    samples = tokenizer.batch_decode(x[:, prompt_len:],skip_special_tokens=True)
+    samples = tokenizer.batch_decode(x[:, prompt_len:], skip_special_tokens=True)
 
     for b in range(batch_size):
         raw_ids = x[b, prompt_len:].tolist()
