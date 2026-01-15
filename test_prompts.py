@@ -61,20 +61,11 @@ if __name__ == "__main__":
             "name": "Baseline (No DPP)",
             "alpha": 0.0, "quality": 0.0, "pool": "max", "target": "logits", "temp": 1
         },
+
         # todo strategy + progressive
-        {
-            "name": "DPP alpha=3",
-            "alpha": 3.0, "quality": 1.0, "pool": "max", "target": "logits", "temp": 1
-        },
-        {
-            "name": "DPP alpha=5",
-            "alpha": 5.0, "quality": 1.0, "pool": "max", "target": "logits", "temp": 1
-        },
-        {
-            "name": "DPP alpha=10",
-            "alpha": 10.0, "quality": 1.0, "pool": "max", "target": "logits", "temp": 1
-        },
     ]
+
+    settings.extend([{"name": f"alpha: {a}", "alpha": a, "quality": 0.1, "temp": 1, "pool": "max", "target": "logits"} for a in [2, 4, 8, 16, 32, 256, 512, 2048, 8192, 32968]])
 
     model, tokenizer, embedding_matrix, mask_token_id = load_model()
 

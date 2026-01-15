@@ -4,280 +4,156 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 from transformers import AutoModel, AutoTokenizer, BitsAndBytesConfig
-from utils import save_html_dashboard
+
+# Import logic from your existing files
+from dpp_gen import (
+    apply_dpp_guidance,
+    get_num_transfer_tokens,
+    add_gumbel_noise
+)
 
 # -----------------------------------------------------------------------------
 # 1. SETUP
 # -----------------------------------------------------------------------------
 MODEL_ID = "GSAI-ML/LLaDA-8B-Instruct"
 
-bnb_config = BitsAndBytesConfig(
-    load_in_4bit=True,
-    bnb_4bit_compute_dtype=torch.bfloat16,
-    bnb_4bit_use_double_quant=True,
-    bnb_4bit_quant_type="nf4"
-)
+def load_model():
+    print(f"Loading {MODEL_ID}...")
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_compute_dtype=torch.bfloat16,
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_quant_type="nf4"
+    )
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
+    model = AutoModel.from_pretrained(
+        MODEL_ID,
+        trust_remote_code=True,
+        quantization_config=bnb_config,
+        device_map="auto"
+    )
+    model.eval()
+    tokenizer.padding_side = 'left'
 
-print(f"Loading {MODEL_ID}...")
-tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
-model = AutoModel.from_pretrained(
-    MODEL_ID,
-    trust_remote_code=True,
-    quantization_config=bnb_config,
-    device_map="auto"
-)
-model.eval()
+    mask_token_id = tokenizer.mask_token_id
+    if mask_token_id is None: mask_token_id = 126336
 
-# Ensure padding side is left for generation mechanics
-tokenizer.padding_side = 'left'
+    return model, tokenizer, mask_token_id
 
-MASK_TOKEN_ID = tokenizer.mask_token_id
-if MASK_TOKEN_ID is None:
-    MASK_TOKEN_ID = 126336  # LLaDA specific default
+# -----------------------------------------------------------------------------
+# 2. RICH DATA CAPTURE HELPER
+# -----------------------------------------------------------------------------
+def capture_top_k(logits, k=5):
+    vals, indices = torch.topk(logits, k)
+    return indices.tolist(), vals.tolist()
 
-# Extract Embedding Matrix for 'embeddings' kernel target
-if hasattr(model, "model") and hasattr(model.model, "transformer"):
-    EMBEDDING_MATRIX = model.model.transformer.wte.weight
-else:
-    EMBEDDING_MATRIX = None
+def capture_top_k_abs(tensor, k=5):
+    vals, indices = torch.topk(tensor.abs(), k)
+    signed_vals = tensor[indices]
+    return indices.tolist(), signed_vals.tolist()
 
+def decode_top_k(indices, vals, tokenizer):
+    decoded = []
+    for idx, val in zip(indices, vals):
+        token_str = tokenizer.decode([idx]).replace("Ġ", " ").replace("\n", "⏎")
+        decoded.append({"t": token_str, "v": round(val, 2)})
+    return decoded
 
-def add_gumbel_noise(logits, temperature):
-    '''
-    The Gumbel max is a method for sampling categorical distributions.
-    '''
-    if temperature == 0:
-        return logits
-
-    # Use float64 for stability as per LLaDA implementation
-    logits = logits.to(torch.float64)
-    noise = torch.rand_like(logits, dtype=torch.float64)
-    gumbel_noise = (- torch.log(noise)) ** temperature
-    return logits.exp() / gumbel_noise
-
-
-def get_num_transfer_tokens(mask_index, steps):
-    '''
-    Precompute the number of tokens to transfer (unmask) at each step.
-    Implements a linear schedule.
-    '''
-    mask_num = mask_index.sum(dim=1, keepdim=True)
-
-    # Prevent division by zero if steps > mask_num (rare edge case in visualization)
-    steps = min(steps, mask_num.max().item()) if mask_num.max().item() > 0 else steps
-    if steps == 0: steps = 1
-
-    base = mask_num // steps
-    remainder = mask_num % steps
-
-    num_transfer_tokens = torch.zeros(mask_num.size(0), steps, device=mask_index.device, dtype=torch.int64) + base
-
-    for i in range(mask_num.size(0)):
-        num_transfer_tokens[i, :remainder[i]] += 1
-
-    return num_transfer_tokens
-
-
-def apply_dpp_guidance(
-        logits,
-        mask_index,
-        x,
-        alpha=3.0,
-        quality_scale=1.0,
-        pooling_method="max",
-        use_projection=False,
-        kernel_target="logits",
-        entropy_threshold=0.6,
-        protected_tokens=None,
-        strategy="sequential"  # NEW PARAMETER: "joint" or "sequential"
-):
-    metadata = {
-        "gate": 0.0,
-        "entropy_map": torch.zeros(logits.shape[:2]).tolist(),
-        "force_map": torch.zeros(logits.shape[:2]).tolist()
-    }
-
-    if logits.shape[0] < 2: return logits, metadata
-
-    probs = torch.softmax(logits, dim=-1)
-    log_probs = torch.log_softmax(logits, dim=-1)
-    entropy_map = -torch.sum(probs * log_probs, dim=-1)  # [Batch, Seq]
-    metadata["entropy_map"] = entropy_map.detach().float().cpu()
-    #
-
-    # Gate calculation
-    pooled_entropy = entropy_map.mean(dim=1, keepdim=True)
-    gate = torch.sigmoid((pooled_entropy - entropy_threshold) * 10.0)
-    metadata["gate"] = gate.mean().item()
-
-    if gate.mean() < 0.05:
-        return logits, metadata
-
-    with torch.enable_grad():
-        logits_in = logits.detach().clone().requires_grad_(True)
-        probs_in_ = torch.softmax(logits_in, dim=-1)
-
-        # Mixed Representation (Probs + OneHot)
-        probs_in = torch.zeros_like(probs_in_).to(probs_in_.device)
-        probs_in[mask_index] = probs_in_[mask_index]
-        one_hot_tokens = F.one_hot(x[~mask_index], num_classes=probs_in.shape[-1])
-        probs_in[~mask_index] = one_hot_tokens.to(dtype=probs_in.dtype)
-
-        # Feature selection (Embeddings or Logits)
-        if kernel_target == "embeddings" and EMBEDDING_MATRIX is not None:
-            W = EMBEDDING_MATRIX.to(probs_in.device).detach()
-            features = torch.matmul(probs_in, W)
-        else:
-            features = probs_in
-
-        # Pooling
-        if pooling_method == "max":
-            vecs = features.max(dim=1).values
-        else:
-            vecs = features.mean(dim=1)
-
-        # Normalize vectors for Cosine Similarity
-        norm_vec = F.normalize(vecs, p=2, dim=1)
-
-        final_grad = torch.zeros_like(logits_in)
-
-        if strategy == "joint":
-            K = torch.mm(norm_vec, norm_vec.t())
-            identity = torch.eye(K.shape[0], device=K.device)
-            jitter = 1e-4
-
-            # Quality Term
-            max_conf = probs_in.max(dim=-1).values.mean(dim=1)
-            quality_matrix = torch.outer(max_conf, max_conf)
-            L = K * (1 + quality_scale * quality_matrix)
-
-            term1 = torch.logdet(L + jitter * identity)
-            term2 = torch.logdet(L + identity + jitter * identity)
-            loss = -(term1 - term2)
-
-            final_grad = torch.autograd.grad(loss, logits_in)[0]
-
-        elif strategy == "sequential":
-            # --- NEW METHOD: Conditional Anchoring ---
-            # We iterate k from 1 to Batch_Size.
-            # Note: k=0 (Batch idx 0) gets 0 gradient (Independent).
-
-            for k in range(1, logits.shape[0]):
-                sub_vecs = norm_vec[:k + 1]
-
-                # 2. Construct Sub-Kernel
-                K_sub = torch.mm(sub_vecs, sub_vecs.t())
-                identity_sub = torch.eye(k + 1, device=K_sub.device)
-                jitter = 1e-4
-
-                sub_conf = probs_in.max(dim=-1).values.mean(dim=1)[:k + 1]
-                q_sub = torch.outer(sub_conf, sub_conf)
-                L_sub = K_sub * (1 + quality_scale * q_sub)
-
-                term1 = torch.logdet(L_sub + jitter * identity_sub)
-                term2 = torch.logdet(L_sub + identity_sub + jitter * identity_sub)
-                loss = -(term1 - term2)
-
-                grads = torch.autograd.grad(loss, logits_in, retain_graph=True)[0]
-
-                final_grad[k] = grads[k]
-
-    # Zero out gradient for protected tokens (EOS, PAD)
-    if protected_tokens is not None:
-        final_grad.index_fill_(2, protected_tokens, 0.0)
-
-    token_norms = torch.norm(final_grad, p=2, dim=-1, keepdim=True)
-    max_norms = token_norms.max(dim=1, keepdim=True).values.clamp(min=1e-8)
-    grad_safe = torch.where(max_norms > 0, final_grad / max_norms, final_grad)
-
-    # Projection (Optional)
-    if use_projection:
-        u = logits.detach()
-        inner = (grad_safe * u).sum(dim=-1, keepdim=True)
-        u_norm = (u * u).sum(dim=-1, keepdim=True)
-        proj = (inner / (u_norm + 1e-8)) * u
-        grad_safe = grad_safe - proj
-
-    # Re-calculate gate for metadata (omitted in snippet, assuming it exists)
-    grad_final = grad_safe * gate.unsqueeze(-1)
-
-    # Store Force Magnitude
-    update = alpha * grad_final
-    metadata["force_map"] = torch.norm(update, p=2, dim=-1).detach().float().cpu()
-
-    return logits - update, metadata
-
-
+# -----------------------------------------------------------------------------
+# 3. GENERATION WITH DEEP LOGGING
+# -----------------------------------------------------------------------------
 @torch.no_grad()
-def generate_recorded(
-        prompt,
-        batch_size=4,
-        steps=64,
-        gen_length=64,
-        alpha=3.0,
-        entropy_thresh=0.6,
-        temperature=0.0,
-        target="logits"
+def run_rich_generation(
+        prompt, model, tokenizer, mask_token_id,
+        batch_size=4, steps=32, gen_length=64,
+        alpha=5.0, quality_scale=1.0, entropy_thresh=0.1, temperature=1.0
 ):
+    # Setup
     messages = [{"role": "user", "content": prompt}]
     prompt_str = tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
-
     encoded = tokenizer([prompt_str] * batch_size, return_tensors="pt", padding=True, add_special_tokens=False)
+
     prompt_ids = encoded.input_ids.to(model.device)
     attention_mask = encoded.attention_mask.to(model.device)
-
     prompt_len = prompt_ids.shape[1]
 
-    # 2. Initialize Canvas (Prompt + Masks)
-    x = torch.full((batch_size, prompt_len + gen_length), MASK_TOKEN_ID, dtype=torch.long).to(model.device)
+    # Initialize Canvas
+    x = torch.full((batch_size, prompt_len + gen_length), mask_token_id, dtype=torch.long).to(model.device)
     x[:, :prompt_len] = prompt_ids.clone()
 
-    # Extend attention mask
-    attention_mask = torch.cat(
-        [attention_mask, torch.ones((batch_size, gen_length), dtype=attention_mask.dtype, device=model.device)], dim=-1)
-
-    # 3. Schedule
-    mask_index_init = (x[:, prompt_len:] == MASK_TOKEN_ID)
+    attention_mask = torch.cat([attention_mask, torch.ones((batch_size, gen_length), device=model.device)], dim=-1)
+    mask_index_init = (x[:, prompt_len:] == mask_token_id)
     num_transfer_tokens_schedule = get_num_transfer_tokens(mask_index_init, steps)
-
     protected_tokens = torch.tensor([tokenizer.eos_token_id, tokenizer.pad_token_id], device=model.device)
-    history_frames = []
 
-    print(f"Generating for prompt: '{prompt}' over {steps} steps with LLaDA strategy.")
+    history = []
+    print(f"Generating '{prompt[:30]}...' ({steps} steps)")
 
-    # -------------------------------------------------------------------------
-    # SAMPLING LOOP
-    # -------------------------------------------------------------------------
     for i in range(steps):
-        # Identify current masks
-        mask_index = (x == MASK_TOKEN_ID)
+        print(f"  Step {i+1}/{steps}...", end="\r")
 
-        # A. Model Forward Pass
+        mask_index = (x == mask_token_id)
         logits = model(x, attention_mask=attention_mask).logits
 
-        # B. Calculate DPP Guidance
-        gen_logits = logits[:, prompt_len:, :].clone()
+        gen_logits_pre = logits[:, prompt_len:, :].clone()
+
+        # 2. DPP Guidance
         curr_alpha = alpha * (1 - (i / steps))
 
-        metadata = {
-            "gate": 0.0,
-            "entropy_map": torch.zeros(batch_size, gen_length),
-            "force_map": torch.zeros(batch_size, gen_length)
-        }
+        metadata = {"gate": 0.0, "entropy_map": [], "force_map": []}
+        update_tensor = torch.zeros_like(gen_logits_pre)
+
+        # Calculate 'Pre-Guidance' Winners (to detect flips)
+        top1_pre = gen_logits_pre.argmax(dim=-1)
 
         if curr_alpha > 0.01:
-            gen_logits_guided, metadata = apply_dpp_guidance(
-                gen_logits,
+            gen_logits_post, metadata = apply_dpp_guidance(
+                gen_logits_pre,
+                mask_index=mask_index[:, prompt_len:],
+                x=x[:, prompt_len:],
                 alpha=curr_alpha,
+                quality_scale=quality_scale,
                 entropy_threshold=entropy_thresh,
                 protected_tokens=protected_tokens,
-                kernel_target=target,
-                mask_index=mask_index[:, prompt_len:],
-                x=x[:, prompt_len:]
+                strategy='gram_schmidt',
+                progressive=True,
+                pooling_method='max'
             )
-            logits[:, prompt_len:, :] = gen_logits_guided
+            update_tensor = gen_logits_pre - gen_logits_post
+            logits[:, prompt_len:, :] = gen_logits_post
+        else:
+            gen_logits_post = gen_logits_pre
 
-        # --- CAPTURE STATE (Before Update) ---
+        # Calculate 'Post-Guidance' Winners
+        top1_post = gen_logits_post.argmax(dim=-1)
+
+        # Detect Flips: Where did DPP change the top choice?
+        # (Only counts if the token was MASKED)
+        flips = (top1_pre != top1_post) & mask_index[:, prompt_len:]
+
+        # 3. Sampling Logic (Determines unmasking)
+        logits_noisy = add_gumbel_noise(logits, temperature=temperature)
+        x0 = torch.argmax(logits_noisy, dim=-1)
+
+        p = F.softmax(logits, dim=-1)
+        x0_p = torch.squeeze(torch.gather(p, dim=-1, index=x0.unsqueeze(-1)), -1)
+        x0 = torch.where(mask_index, x0, x)
+        confidence = torch.where(mask_index, x0_p, torch.tensor(-np.inf).to(x0_p.device))
+
+        # Calculate which tokens are unmasked THIS STEP
+        transfer_index = torch.zeros_like(x0, dtype=torch.bool)
+        for j in range(batch_size):
+            k_trans = num_transfer_tokens_schedule[j, i]
+            if k_trans > 0:
+                _, select_index = torch.topk(confidence[j], k=k_trans)
+                transfer_index[j, select_index] = True
+
+        # Determine newly unmasked indices relative to prompt_len
+        # transfer_index is [Batch, Full_Seq]
+        # We need it relative to [Batch, Gen_Seq]
+        newly_unmasked_mask = transfer_index[:, prompt_len:]
+
+        # --- LOGGING ---
         frame_data = {
             "step": i,
             "alpha": float(curr_alpha),
@@ -286,103 +162,341 @@ def generate_recorded(
         }
 
         for b in range(batch_size):
-            raw_ids = x[b, prompt_len:].tolist()
-            display_tokens = []
-            for tid in raw_ids:
-                if tid == MASK_TOKEN_ID:
-                    display_tokens.append("░")
+            batch_info = {
+                "tokens": [],
+                "is_new": [],
+                "is_flip": [],
+                "details": []
+            }
+
+            b_ids = x[b, prompt_len:].tolist()
+            b_logits_pre = gen_logits_pre[b]
+            b_logits_post = gen_logits_post[b]
+            b_update = update_tensor[b]
+            b_force = metadata["force_map"][b].tolist() if len(metadata["force_map"]) > 0 else []
+
+            for t_idx, tid in enumerate(b_ids):
+                # Token Text
+                if tid == mask_token_id:
+                    token_str = "░"
                 else:
-                    t_str = tokenizer.decode([tid])
-                    t_str = t_str.replace("Ġ", " ").replace("\n", "⏎")
-                    if tokenizer.mask_token and tokenizer.mask_token in t_str:
-                        t_str = t_str.replace(tokenizer.mask_token, "░")
-                    display_tokens.append(t_str)
+                    token_str = tokenizer.decode([tid]).replace("Ġ", " ").replace("\n", "⏎")
+                    #if tokenizer.mask_token in token_str: token_str = "░"
 
-            frame_data["batches"].append({
-                "tokens": display_tokens,
-                "is_mask": [tid == MASK_TOKEN_ID for tid in raw_ids],
-                "entropy": metadata["entropy_map"][b].tolist() if len(metadata["entropy_map"]) > 0 else [],
-                "force": metadata["force_map"][b].tolist() if len(metadata["force_map"]) > 0 else []
-            })
-        history_frames.append(frame_data)
-        # -------------------------------------
+                batch_info["tokens"].append(token_str)
 
-        # C. LLaDA Sampling Mechanics
-        logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
-        x0 = torch.argmax(logits_with_noise, dim=-1)
+                # Metadata Flags
+                is_new = newly_unmasked_mask[b, t_idx].item()
+                is_flip = flips[b, t_idx].item()
 
-        p = F.softmax(logits, dim=-1)
-        x0_p = torch.squeeze(
-            torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1
-        )
+                batch_info["is_new"].append(is_new)
+                batch_info["is_flip"].append(is_flip)
 
-        x0 = torch.where(mask_index, x0, x)
-        confidence = torch.where(mask_index, x0_p, torch.tensor(-np.inf).to(x0_p.device))
+                # Capture details
+                # Condition: Masked, Newly Unmasked, Flipped, or High Force
+                is_masked = (tid == mask_token_id)
+                force_mag = b_force[t_idx] if t_idx < len(b_force) else 0.0
 
-        transfer_index = torch.zeros_like(x0, dtype=torch.bool, device=x0.device)
+                detail_obj = None
+                if is_masked or is_new or is_flip or force_mag > 0.5:
+                    idx_pre, val_pre = capture_top_k(b_logits_pre[t_idx], k=5)
+                    idx_post, val_post = capture_top_k(b_logits_post[t_idx], k=5)
+                    idx_upd, val_upd = capture_top_k_abs(b_update[t_idx], k=5)
 
-        for j in range(batch_size):
-            k = num_transfer_tokens_schedule[j, i]
-            if k > 0:
-                _, select_index = torch.topk(confidence[j], k=k)
-                transfer_index[j, select_index] = True
+                    detail_obj = {
+                        "pre": decode_top_k(idx_pre, val_pre, tokenizer),
+                        "post": decode_top_k(idx_post, val_post, tokenizer),
+                        "grad": decode_top_k(idx_upd, val_upd, tokenizer),
+                        "f": round(force_mag, 2),
+                        "flip": is_flip
+                    }
 
-        # Update Canvas
+                batch_info["details"].append(detail_obj)
+
+            batch_info["force"] = b_force
+            batch_info["entropy"] = metadata["entropy_map"][b].tolist() if len(metadata["entropy_map"]) > 0 else []
+            frame_data["batches"].append(batch_info)
+
+        history.append(frame_data)
+
+        # Apply Update
         x[transfer_index] = x0[transfer_index]
 
-    # -------------------------------------------------------------------------
-    # FINAL FRAME CAPTURE (After Loop)
-    # -------------------------------------------------------------------------
-    # We record one last frame to show the completed state after the final update.
-    final_frame = {
-        "step": steps,
-        "alpha": 0.0,
-        "gate": 0.0,
-        "batches": []
-    }
-    for b in range(batch_size):
-        raw_ids = x[b, prompt_len:].tolist()
-        display_tokens = []
-        for tid in raw_ids:
-            if tid == MASK_TOKEN_ID:
-                display_tokens.append("[MASK]")
-            else:
-                t_str = tokenizer.decode([tid])
-                t_str = t_str.replace("Ġ", " ").replace("\n", "⏎")
-                if tokenizer.mask_token and tokenizer.mask_token in t_str:
-                    t_str = t_str.replace(tokenizer.mask_token, "[MASK]")
-                display_tokens.append(t_str)
-
-        final_frame["batches"].append({
-            "tokens": display_tokens,
-            "is_mask": [tid == MASK_TOKEN_ID for tid in raw_ids],
-            "entropy": [],  # No active entropy calc at end state
-            "force": []  # No force at end state
-        })
-    history_frames.append(final_frame)
-
-    return history_frames
-
+    print("\nGeneration Complete.")
+    return history
 
 # -----------------------------------------------------------------------------
-# 5. EXECUTION
+# 4. HTML GENERATOR
+# -----------------------------------------------------------------------------
+def save_rich_dashboard(history, filename="dpp_rich_dashboard.html"):
+    json_data = json.dumps(history)
+
+    html_content = f"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>DPP Inspector v2</title>
+    <style>
+        :root {{
+            --bg: #0e1117;
+            --panel: #1e2127;
+            --border: #30363d;
+            --accent: #2c93ff;
+            --text-main: #c9d1d9;
+            --text-muted: #8b949e;
+            --danger: #ff4b4b;
+            --success: #2ea043;
+            --gold: #ffd700;
+            --flip: #d46bff;
+        }}
+        body {{
+            background: var(--bg); color: var(--text-main); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            margin: 0; padding: 0; display: flex; height: 100vh; overflow: hidden;
+        }}
+
+        /* Layout */
+        .sidebar {{
+            width: 380px; background: var(--panel); border-right: 1px solid var(--border);
+            display: flex; flex-direction: column; padding: 20px; overflow-y: auto; flex-shrink: 0;
+        }}
+        .main-content {{ flex-grow: 1; display: flex; flex-direction: column; overflow: hidden; }}
+        .header {{ padding: 15px 20px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 20px; background: var(--bg); }}
+        .grid-container {{ flex-grow: 1; overflow-y: auto; padding: 20px; }}
+
+        /* Inspector */
+        h2 {{ margin-top: 0; font-size: 1.1em; color: var(--accent); }}
+        .metric-box {{ background: #252a33; padding: 10px; border-radius: 6px; margin-bottom: 15px; }}
+        .badge {{
+            display: inline-block; padding: 2px 6px; border-radius: 4px; font-size: 0.75em; font-weight: bold; margin-right: 5px;
+        }}
+        .badge.flip {{ background: rgba(212, 107, 255, 0.2); color: var(--flip); border: 1px solid var(--flip); }}
+        .badge.new {{ background: rgba(255, 215, 0, 0.2); color: var(--gold); border: 1px solid var(--gold); }}
+
+        table {{ width: 100%; border-collapse: collapse; font-size: 0.85em; margin-bottom: 20px; }}
+        td {{ padding: 3px 0; border-bottom: 1px solid #333; }}
+        td.val {{ text-align: right; font-family: monospace; color: var(--accent); }}
+        td.neg {{ color: var(--danger); }}
+        td.pos {{ color: var(--success); }}
+
+        /* Main Grid */
+        .batch-row {{ margin-bottom: 25px; }}
+        .batch-label {{ color: var(--text-muted); font-size: 0.8em; margin-bottom: 8px; text-transform: uppercase; letter-spacing: 1px; }}
+        .token-stream {{ display: flex; flex-wrap: wrap; gap: 4px; }}
+
+        .t-cell {{
+            font-family: 'Fira Code', monospace; font-size: 13px;
+            padding: 4px 7px; border-radius: 3px; cursor: crosshair;
+            border: 1px solid transparent; transition: all 0.1s;
+            min-width: 10px; text-align: center; position: relative;
+        }}
+        .t-cell:hover {{ border-color: var(--accent); transform: scale(1.1); z-index: 10; }}
+        .t-cell.mask {{ background: #222; color: #555; }}
+        .t-cell.selected {{ border-color: var(--accent); background: rgba(44, 147, 255, 0.2); }}
+
+        /* --- NEW VISUALIZATIONS --- */
+
+        /* 1. Newly Unmasked (Gold Pulse) */
+        @keyframes pulse-gold {{
+            0% {{ box-shadow: 0 0 0 0 rgba(255, 215, 0, 0.7); }}
+            70% {{ box-shadow: 0 0 0 4px rgba(255, 215, 0, 0); }}
+            100% {{ box-shadow: 0 0 0 0 rgba(255, 215, 0, 0); }}
+        }}
+        .t-cell.new {{
+            border: 1px solid var(--gold);
+            animation: pulse-gold 1s infinite;
+        }}
+
+        /* 2. DPP Flip (Purple Marker) */
+        .t-cell.flip::after {{
+            content: '⚡';
+            position: absolute; top: -8px; right: -6px;
+            font-size: 10px; color: var(--flip);
+            background: #0e1117; border-radius: 50%; padding: 1px;
+        }}
+        .t-cell.flip {{
+            border-bottom: 2px solid var(--flip);
+        }}
+
+    </style>
+</head>
+<body>
+
+    <div class="sidebar" id="inspector">
+        <h2>Token Inspector</h2>
+        <div style="color:#666; font-size:0.9em; margin-bottom:20px;">
+            Hover grid to inspect. <br>
+            <span style="color:var(--gold)">Gold Border</span> = Unmasked this step <br>
+            <span style="color:var(--flip)">⚡ / Purple</span> = DPP forced a change
+        </div>
+    </div>
+
+    <div class="main-content">
+        <div class="header">
+            <h3>DPP Rich Dashboard</h3>
+            <div style="display:flex; gap:10px; margin-left:auto;">
+                <button id="playBtn">Play</button>
+                <input type="range" id="slider" min="0" max="{len(history)-1}" value="0">
+                <span id="stepLabel" style="font-family:monospace; min-width: 80px;">Step 0</span>
+            </div>
+        </div>
+        <div class="grid-container" id="grid"></div>
+    </div>
+
+<script>
+    const history = {json_data};
+    const grid = document.getElementById('grid');
+    const inspector = document.getElementById('inspector');
+    const slider = document.getElementById('slider');
+    const stepLabel = document.getElementById('stepLabel');
+    const playBtn = document.getElementById('playBtn');
+
+    let isPlaying = false;
+    let playInterval;
+
+    function renderStep(step) {{
+        const frame = history[step];
+        stepLabel.innerText = `Step ${{frame.step}}`;
+        grid.innerHTML = '';
+
+        frame.batches.forEach((batch, bIdx) => {{
+            const row = document.createElement('div');
+            row.className = 'batch-row';
+            row.innerHTML = `<div class="batch-label">Batch ${{bIdx}}</div>`;
+
+            const stream = document.createElement('div');
+            stream.className = 'token-stream';
+
+            batch.tokens.forEach((text, tIdx) => {{
+                const el = document.createElement('div');
+                el.className = 't-cell';
+                el.innerText = text;
+
+                // 1. Basic Classes
+                if (text === '░' || text === '[MASK]') el.classList.add('mask');
+
+                // 2. New Highlights
+                if (batch.is_new[tIdx]) el.classList.add('new');
+                if (batch.is_flip[tIdx]) el.classList.add('flip');
+
+                // 3. Heatmap Background (Entropy)
+                const ent = batch.entropy ? batch.entropy[tIdx] : 0;
+                let bg = el.classList.contains('mask') ? '#222' : '#2b2b2b';
+                if (ent > 0.1) {{
+                    const op = Math.min(ent / 3, 0.6);
+                    bg = `rgba(200, 50, 50, ${{op}})`;
+                }}
+                el.style.backgroundColor = bg;
+
+                el.onmouseenter = () => updateInspector(step, bIdx, tIdx);
+                stream.appendChild(el);
+            }});
+
+            row.appendChild(stream);
+            grid.appendChild(row);
+        }});
+    }}
+
+    function updateInspector(step, bIdx, tIdx) {{
+        const batch = history[step].batches[bIdx];
+        const details = batch.details ? batch.details[tIdx] : null;
+        const isNew = batch.is_new[tIdx];
+        const isFlip = batch.is_flip[tIdx];
+
+        let html = `<h2>Batch ${{bIdx}} : Token ${{tIdx}}</h2>`;
+
+        // Badges
+        html += `<div style="margin-bottom:10px;">`;
+        if (isNew) html += `<span class="badge new">UNMASKED</span>`;
+        if (isFlip) html += `<span class="badge flip">DPP FLIP</span>`;
+        html += `</div>`;
+
+        html += `<div class="metric-box">
+            <div><span class="stat-label">Token:</span> <span style="color:#fff; font-weight:bold">${{batch.tokens[tIdx]}}</span></div>
+            <div><span class="stat-label">Entropy:</span> ${{(batch.entropy[tIdx]||0).toFixed(2)}}</div>
+        </div>`;
+
+        if (!details) {{
+            html += `<div style="color:#555; text-align:center; margin-top:30px;">No detailed telemetry.<br>(Inactive token)</div>`;
+            inspector.innerHTML = html;
+            return;
+        }}
+
+        const renderTable = (title, rows) => {{
+            let h = `<div style="margin-bottom:15px; border-bottom:1px solid #333; padding-bottom:5px; color:#888; font-size:0.9em">${{title}}</div><table>`;
+            rows.forEach(r => {{
+                h += `<tr><td>${{r.t}}</td><td class="val">${{r.v.toFixed(2)}}</td></tr>`;
+            }});
+            return h + `</table>`;
+        }};
+
+        // 1. Pre
+        html += renderTable("Model Preference (Original)", details.pre);
+
+        // 2. Grad
+        // Convert 'Update' to 'Effect' (-1 * Update) for display
+        let gradRows = details.grad.map(g => ({{ t: g.t, v: -1 * g.v }}));
+        let gHtml = `<div style="margin-bottom:15px; border-bottom:1px solid #333; padding-bottom:5px; color:#888; font-size:0.9em">DPP Correction</div><table>`;
+        gradRows.forEach(g => {{
+            const cls = g.v > 0 ? 'pos' : 'neg';
+            const sign = g.v > 0 ? '+' : '';
+            gHtml += `<tr><td>${{g.t}}</td><td class="val ${{cls}}">${{sign}}${{g.v.toFixed(2)}}</td></tr>`;
+        }});
+        html += gHtml + `</table>`;
+
+        // 3. Post
+        html += renderTable("Final Logits (Used)", details.post);
+
+        inspector.innerHTML = html;
+    }}
+
+    slider.addEventListener('input', (e) => renderStep(e.target.value));
+
+    playBtn.addEventListener('click', () => {{
+        if (isPlaying) {{
+            clearInterval(playInterval);
+            playBtn.innerText = "Play";
+            isPlaying = false;
+        }} else {{
+            playBtn.innerText = "Pause";
+            isPlaying = true;
+            playInterval = setInterval(() => {{
+                let v = parseInt(slider.value) + 1;
+                if (v >= history.length) v = 0;
+                slider.value = v;
+                renderStep(v);
+            }}, 200);
+        }}
+    }});
+
+    renderStep(0);
+</script>
+</body>
+</html>
+    """
+
+    with open(filename, "w", encoding="utf-8") as f:
+        f.write(html_content)
+    print(f"\nDashboard saved to {filename}")
+
+# -----------------------------------------------------------------------------
+# 5. MAIN
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
-    PROMPT = "Write a short poem about rust and code."
+    PROMPT = "Write a python function to compute fibonacci."
 
-    print(">>> GENERATING VISUALIZATION DATA <<<")
-    history = generate_recorded(
-        PROMPT,
+    model, tokenizer, mask_id = load_model()
+
+    history = run_rich_generation(
+        prompt=PROMPT,
+        model=model,
+        tokenizer=tokenizer,
+        mask_token_id=mask_id,
         batch_size=4,
         steps=32,
         gen_length=64,
-        # alpha=5.0,
-        alpha=0.0,
-        entropy_thresh=0.1,
-        # temperature=1.0,
-        temperature=1.0,
-        target="logits"
+        alpha=10.0, 
+        quality_scale=0.1# High alpha to ensure we see flips
     )
 
-    save_html_dashboard(history)
-    print("Done. Saved dashboard.")
+    save_rich_dashboard(history)

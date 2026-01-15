@@ -147,16 +147,46 @@ def _normalize_gradient(grad, protected_tokens=None):
 
 
 def _step_gram_schmidt(logit_k, norm_vec_k, quality_k, basis_vectors, quality_scale):
-    v_perp = norm_vec_k.clone()
-    for q in basis_vectors:
-        # Project v_k onto q
-        proj = torch.dot(norm_vec_k.view(-1), q.view(-1)) * q
-        v_perp = v_perp - proj
+    """
+    Calculates the gradient to MINIMIZE similarity with history.
+    Uses dot-product formulation to avoid zero-gradients at perfect overlap.
+    """
+    # We want to minimize the sum of squared cosine similarities.
+    # Loss = Sum( (v . q)^2 )
 
-    resid_norm = torch.norm(v_perp, p=2)
-    loss = -1.0 * (resid_norm ** 2) * (quality_scale * quality_k)
-    # loss = -1.0 * (resid_norm ** 2) * (1.0 + quality_scale * quality_k)
-    return torch.autograd.grad(loss, logit_k)[0]
+    similarity_loss = torch.tensor(0.0, device=logit_k.device)
+
+    for q in basis_vectors:
+        # q is the history vector (detached)
+        # norm_vec_k is the current vector (attached to graph)
+
+        # Flatten [Batch, 2*Vocab] -> [1D] for dot product
+        dot = torch.dot(norm_vec_k.view(-1), q.view(-1))
+
+        # We square it to penalize alignment in either direction (+/-)
+        similarity_loss = similarity_loss + (dot ** 2)
+
+    # We want to MINIMIZE this loss.
+    # The optimization loop performs Gradient Descent (logits -= grad).
+    # So we simply return the gradient of the loss we want to minimize.
+
+    # Apply Quality Weighting (Only push if model is confident)
+    weighted_loss = similarity_loss * (quality_scale * quality_k)
+
+    return torch.autograd.grad(weighted_loss, logit_k)[0]
+
+
+# def _step_gram_schmidt(logit_k, norm_vec_k, quality_k, basis_vectors, quality_scale):
+#     v_perp = norm_vec_k.clone()
+#     for q in basis_vectors:
+#         # Project v_k onto q
+#         proj = torch.dot(norm_vec_k.view(-1), q.view(-1)) * q
+#         v_perp = v_perp - proj
+#
+#     resid_norm = torch.norm(v_perp, p=2)
+#     loss = -1.0 * (resid_norm ** 2) * (quality_scale * quality_k)
+#     # loss = -1.0 * (resid_norm ** 2) * (1.0 + quality_scale * quality_k)
+#     return torch.autograd.grad(loss, logit_k)[0]
 
 
 def _step_sequential_logdet(logit_k, norm_vec_k, quality_k, previous_vecs, previous_qualities, quality_scale):
