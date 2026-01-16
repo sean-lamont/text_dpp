@@ -29,46 +29,253 @@ def compute_entropy_metadata(logits, entropy_threshold):
 
 
 def extract_feature_vector_phasor(logit_k, mask_k, x_k, embedding_matrix, kernel_target, pooling_method,
-                                  seq_len_scale=64):
+                                  seq_len_scale=64, top_k=5, temp=1.0):
     """
-    Encodes position as phase angle.
-    Doubles feature dim from [Vocab] to [2 * Vocab].
+    Top-K Phasor Extraction with Context Awareness.
+
+    1. Filters logits to Top-K (Denoising) for MASKED tokens.
+    2. Uses One-Hot encoding for UNMASKED (context/history) tokens.
+    3. Combines them into a single 'Sequence State' representation.
+    4. Encodes position as phase angle and sums them up.
     """
     if logit_k.dim() == 2: logit_k = logit_k.unsqueeze(0)
     if mask_k.dim() == 1: mask_k = mask_k.unsqueeze(0)
     if x_k.dim() == 1: x_k = x_k.unsqueeze(0)
 
-    probs_in_ = torch.softmax(logit_k, dim=-1)
-    probs_in = torch.zeros_like(probs_in_)
-    probs_in[mask_k] = probs_in_[mask_k]
+    # 1. Softmax with Temp (for the Masked regions)
+    probs = torch.softmax(logit_k / temp, dim=-1)
+
+    # 2. Top-K Filtering (Sparsification)
+    if top_k > 0:
+        vals, indices = torch.topk(probs, k=top_k, dim=-1)
+        sparse_probs = torch.zeros_like(probs)
+        sparse_probs.scatter_(2, indices, vals)
+    else:
+        sparse_probs = probs
+
+    # 3. Construct the Full Sequence Representation
+    # A. Masked Tokens: Use the sparse probabilities from the model
+    # B. Unmasked Tokens: Use exact One-Hot encoding from x (The established past)
+
+    # Ensure mask is broadcastable [Batch, Seq, 1]
+    mask_expanded = mask_k.unsqueeze(-1).float()
+
+    # Zero out unmasked regions in the prob tensor (we don't care what the model *thinks* about established tokens)
+    active_probs = sparse_probs * mask_expanded
+
+    # Create One-Hot for established tokens
     if (~mask_k).any():
-        one_hot = F.one_hot(x_k[~mask_k], num_classes=probs_in.shape[-1])
-        probs_in[~mask_k] = one_hot.to(dtype=probs_in.dtype)
+        # Get one-hot encoding of the input ids
+        # Safety: Ensure x_k is long tensor
+        one_hot_established = F.one_hot(x_k, num_classes=probs.shape[-1]).float()
 
-    max_vals, max_indices = probs_in.max(dim=1)
+        # Zero out the MASKED regions in the one-hot (we don't want to encode the [MASK] token itself)
+        # We strictly multiply by (1 - mask) to keep only the established parts.
+        established_probs = one_hot_established * (1.0 - mask_expanded)
 
-    # We map sequence length [0, seq_len] to angle [0, pi/2]
-    # This ensures 0 and End are orthogonal, but not anti-parallel (which would be -1 sim)
+        # Combine: Future Predictions + Past Facts
+        total_probs = active_probs + established_probs
+    else:
+        total_probs = active_probs
+
+    batch_size, seq_len, vocab_size = total_probs.shape
+
+    # 4. Phasor Encoding
+    # Map sequence length [0, seq_len] to angle [0, pi/2]
     omega = (torch.pi / 2.0) / seq_len_scale
-    angles = max_indices.float() * omega  # [Batch, Vocab]
 
-    # The magnitude is the confidence (max_vals)
-    # The direction is the token identity
-    # The phase is the position
-    real_part = max_vals * torch.cos(angles)
-    imag_part = max_vals * torch.sin(angles)
+    # Create position tensor: [1, Seq, 1]
+    pos_indices = torch.arange(seq_len, device=logit_k.device).view(1, -1, 1)
+    angles = pos_indices.float() * omega
 
+    # Real = Sum_t ( Prob_t * cos(theta_t) )
+    real_part = (total_probs * torch.cos(angles)).sum(dim=1)
+
+    # Imag = Sum_t ( Prob_t * sin(theta_t) )
+    imag_part = (total_probs * torch.sin(angles)).sum(dim=1)
+
+    # Concatenate -> [Batch, 2*Vocab]
     phasor_vec = torch.cat([real_part, imag_part], dim=-1)
 
-    # quality mean max value, only over mask tokens
-    all_max_vals = probs_in.max(dim=-1).values
-    masked_max_vals = all_max_vals * mask_k.float()
-    num_masked = mask_k.sum(dim=1).clamp(min=1.0)
-    quality = masked_max_vals.sum(dim=1) / num_masked
+    # Normalize
+    norm_vec = F.normalize(phasor_vec, p=2, dim=1)
 
-    # quality = probs_in.max(dim=-1).values.mean(dim=1)
+    # Quality uses standard probs to measure "Confidence of the Fill"
+    # We still only care about the quality of the *Masked* regions for scaling the force
+    with torch.no_grad():
+        max_vals = probs.max(dim=-1).values
+        masked_max_vals = max_vals * mask_k.float()
+        num_masked = mask_k.sum(dim=1).clamp(min=1.0)
+        quality = masked_max_vals.sum(dim=1) / num_masked
 
-    return F.normalize(phasor_vec, p=2, dim=1), quality
+    return norm_vec, quality
+
+
+# def _step_sequential_subtraction(logit_k, mask_k, x_k, embedding_matrix, kernel_target, pooling_method, history_vecs,
+#                                  quality_scale, alpha):
+#     """
+#     Iterative/Sequential Subtraction with Saturation Fix.
+#     """
+#     curr_logits = logit_k.clone()
+#
+#     # Use a higher temperature for gradient calculation to avoid softmax saturation
+#     GRAD_TEMP = 2.0
+#
+#     for q in history_vecs:
+#         curr_logits = curr_logits.detach().requires_grad_(True)
+#
+#         # 1. Re-evaluate feature vector at the CURRENT position
+#         # Using Top-K=5 for robust sensing of the probability landscape
+#         norm_vec, qual = extract_feature_vector_phasor(
+#             curr_logits, mask_k, x_k, embedding_matrix, kernel_target, pooling_method,
+#             temp=GRAD_TEMP, top_k=5
+#         )
+#
+#         # 2. Calculate Gradient vs current history item q
+#         dot = torch.dot(norm_vec.view(-1), q.view(-1))
+#         loss = (dot ** 2) * (quality_scale * qual)
+#
+#         grad = torch.autograd.grad(loss, curr_logits)[0]
+#
+#         # 3. Update immediately (Lookahead step)
+#         with torch.no_grad():
+#             curr_logits = curr_logits - (alpha * grad)
+#
+#     total_displacement = logit_k - curr_logits
+#
+#     if alpha < 1e-6:
+#         return torch.zeros_like(logit_k)
+#
+#     return total_displacement / alpha
+
+
+def apply_dpp_guidance(
+        logits,
+        mask_index,
+        x,
+        alpha=3.0,
+        quality_scale=1.0,
+        entropy_threshold=0.6,
+        protected_tokens=None,
+        kernel_target="logits",
+        embedding_matrix=None,
+        strategy='sequential_subtraction',
+        progressive=True,
+        pooling_method='max'
+):
+    metadata = {
+        "gate": 0.0,
+        "entropy_map": [],
+        "force_map": []
+    }
+
+    if logits.shape[0] < 2: return logits, metadata
+
+    meta = compute_entropy_metadata(logits, entropy_threshold)
+    metadata["gate"] = meta["gate"]
+    metadata["entropy_map"] = meta["entropy_map"]
+
+    current_logits = logits.clone().detach()
+    final_grads = torch.zeros_like(logits)
+
+    history_vecs = []
+    history_qualities = []
+
+    with torch.enable_grad():
+        if strategy == "joint":
+            # (Joint strategy code remains same...)
+            logits_in = logits.detach().clone().requires_grad_(True)
+            norm_vecs, quals = extract_feature_vector(
+                logits_in, mask_index, x, embedding_matrix, kernel_target, pooling_method
+            )
+            K = torch.mm(norm_vecs, norm_vecs.t())
+            identity = torch.eye(K.shape[0], device=K.device)
+            jitter = 1e-4
+            q_mat = torch.outer(quals, quals)
+            L = K * (1 + quality_scale * q_mat)
+            loss = -(torch.logdet(L + jitter * identity) - torch.logdet(L + identity + jitter * identity))
+            raw_grads = torch.autograd.grad(loss, logits_in)[0]
+            final_grads = _normalize_gradient(raw_grads, protected_tokens)
+
+        else:
+            for k in range(logits.shape[0]):
+                logit_k = logits[k].unsqueeze(0).detach().clone().requires_grad_(True)
+
+                # Extraction for HISTORY tracking (Initial state)
+                # Use standard Temp=1.0 and Top-K=5 to get the precise fingerprint
+                norm_vec_k, qual_k = extract_feature_vector_phasor(
+                    logit_k, mask_index[k].unsqueeze(0), x[k].unsqueeze(0),
+                    embedding_matrix, kernel_target, pooling_method,
+                    temp=1.0, top_k=5
+                )
+
+                if k > 0:
+                    if strategy == "gram_schmidt":
+                        grad_k = _step_gram_schmidt(
+                            logit_k, norm_vec_k, qual_k, history_vecs, quality_scale
+                        )
+                    elif strategy == "sequential":
+                        prev_v_stack = torch.cat(history_vecs, dim=0) if history_vecs else torch.empty(0)
+                        prev_q_stack = torch.tensor(history_qualities, device=logit_k.device)
+                        grad_k = _step_sequential_logdet(
+                            logit_k, norm_vec_k, qual_k, prev_v_stack, prev_q_stack, quality_scale
+                        )
+                    elif strategy == "sequential_subtraction":
+                        grad_k = _step_sequential_subtraction(
+                            logit_k,
+                            mask_index[k].unsqueeze(0),
+                            x[k].unsqueeze(0),
+                            embedding_matrix,
+                            kernel_target,
+                            pooling_method,
+                            history_vecs,
+                            quality_scale,
+                            alpha
+                        )
+
+                    grad_k_norm = _normalize_gradient(grad_k.squeeze(0), protected_tokens)
+                    final_grads[k] = grad_k_norm
+
+                if progressive and k > 0:
+                    current_logits[k] -= (alpha * final_grads[k])
+
+                if progressive:
+                    with torch.no_grad():
+                        norm_vec_new, qual_new = extract_feature_vector_phasor(
+                            current_logits[k].unsqueeze(0),
+                            mask_index[k].unsqueeze(0),
+                            x[k].unsqueeze(0),
+                            embedding_matrix, kernel_target, pooling_method,
+                            temp=1.0, top_k=5
+                        )
+
+                        if strategy == "gram_schmidt" or strategy == "sequential_subtraction":
+                            v_perp = norm_vec_new.clone()
+                            for q in history_vecs:
+                                proj = torch.dot(norm_vec_new.view(-1), q.view(-1)) * q
+                                v_perp = v_perp - proj
+
+                            resid = torch.norm(v_perp, p=2)
+                            if resid > 1e-6:
+                                history_vecs.append(v_perp / resid)
+                        else:
+                            history_vecs.append(norm_vec_new)
+                            history_qualities.append(qual_new.item())
+                else:
+                    if strategy == "gram_schmidt":
+                        v_perp = norm_vec_k.detach().clone()
+                        for q in history_vecs:
+                            proj = torch.dot(v_perp.view(-1), q.view(-1)) * q
+                            v_perp = v_perp - proj
+                        resid = torch.norm(v_perp)
+                        if resid > 1e-6: history_vecs.append(v_perp / resid)
+                    else:
+                        history_vecs.append(norm_vec_k.detach())
+                        history_qualities.append(qual_k.item())
+
+    update = alpha * final_grads
+    metadata["force_map"] = torch.norm(update, p=2, dim=-1).detach().float().cpu()
+
 
 
 def extract_feature_vector(logit_k, mask_k, x_k, embedding_matrix, kernel_target, pooling_method):
@@ -198,9 +405,6 @@ def _step_gram_schmidt(logit_k, norm_vec_k, quality_k, basis_vectors, quality_sc
 
     return torch.autograd.grad(weighted_loss, logit_k)[0]
 
-
-
-
 def _step_sequential_subtraction(logit_k, mask_k, x_k, embedding_matrix, kernel_target, pooling_method, history_vecs,
                                  quality_scale, alpha):
     """
@@ -228,7 +432,6 @@ def _step_sequential_subtraction(logit_k, mask_k, x_k, embedding_matrix, kernel_
 
         grad = torch.autograd.grad(loss, curr_logits)[0]
 
-        # 3. Update immediately (Lookahead step)
         with torch.no_grad():
             curr_logits = curr_logits - (alpha * grad)
 
@@ -241,152 +444,6 @@ def _step_sequential_subtraction(logit_k, mask_k, x_k, embedding_matrix, kernel_
         return torch.zeros_like(logit_k)
 
     return total_displacement / alpha
-
-
-def apply_dpp_guidance(
-        logits,
-        mask_index,
-        x,
-        alpha=3.0,
-        quality_scale=1.0,
-        entropy_threshold=0.6,
-        protected_tokens=None,
-        kernel_target="logits",
-        embedding_matrix=None,
-        strategy='gram_schmidt',  # 'joint', 'sequential', 'gram_schmidt', 'sequential_subtraction'
-        progressive=True,  # Re-compute features after every update?
-        pooling_method='max'
-):
-    metadata = {
-        "gate": 0.0,
-        "entropy_map": [],
-        "force_map": []
-    }
-
-    if logits.shape[0] < 2: return logits, metadata
-
-    meta = compute_entropy_metadata(logits, entropy_threshold)
-    metadata["gate"] = meta["gate"]
-    metadata["entropy_map"] = meta["entropy_map"]
-
-    # if meta["gate"] < 0.05:
-    #     return logits, metadata
-
-    current_logits = logits.clone().detach()
-    final_grads = torch.zeros_like(logits)
-
-    history_vecs = []
-    history_qualities = []
-
-    with torch.enable_grad():
-        if strategy == "joint":
-            logits_in = logits.detach().clone().requires_grad_(True)
-            norm_vecs, quals = extract_feature_vector(
-                logits_in, mask_index, x, embedding_matrix, kernel_target, pooling_method
-            )
-
-            K = torch.mm(norm_vecs, norm_vecs.t())
-            identity = torch.eye(K.shape[0], device=K.device)
-            jitter = 1e-4
-
-            q_mat = torch.outer(quals, quals)
-            L = K * (1 + quality_scale * q_mat)
-
-            loss = -(torch.logdet(L + jitter * identity) - torch.logdet(L + identity + jitter * identity))
-            raw_grads = torch.autograd.grad(loss, logits_in)[0]
-
-            final_grads = _normalize_gradient(raw_grads, protected_tokens)
-
-            final_grads = final_grads  # * meta["per_sample_gate"].unsqueeze(-1)
-
-        else:
-            for k in range(logits.shape[0]):
-
-                # A. Gradient Calculation
-                logit_k = logits[k].unsqueeze(0).detach().clone().requires_grad_(True)
-
-                norm_vec_k, qual_k = extract_feature_vector_phasor(
-                    logit_k, mask_index[k].unsqueeze(0), x[k].unsqueeze(0),
-                    embedding_matrix, kernel_target, pooling_method
-                )
-
-                if k > 0:
-                    if strategy == "gram_schmidt":
-                        grad_k = _step_gram_schmidt(
-                            logit_k, norm_vec_k, qual_k, history_vecs, quality_scale
-                        )
-                    elif strategy == "sequential":
-                        prev_v_stack = torch.cat(history_vecs, dim=0) if history_vecs else torch.empty(0)
-                        prev_q_stack = torch.tensor(history_qualities, device=logit_k.device)
-                        grad_k = _step_sequential_logdet(
-                            logit_k, norm_vec_k, qual_k, prev_v_stack, prev_q_stack, quality_scale
-                        )
-                    elif strategy == "sequential_subtraction":
-                        # New Strategy Integration
-                        grad_k = _step_sequential_subtraction(
-                            logit_k,
-                            mask_index[k].unsqueeze(0),
-                            x[k].unsqueeze(0),
-                            embedding_matrix,
-                            kernel_target,
-                            pooling_method,
-                            history_vecs,
-                            quality_scale,
-                            alpha
-                        )
-
-                    # Normalize (Max Norm) and Gate
-                    grad_k_norm = _normalize_gradient(grad_k.squeeze(0), protected_tokens)
-                    final_grads[k] = grad_k_norm  # * meta["per_sample_gate"][k]
-
-                # B. Progressive Update
-                if progressive and k > 0:
-                    # Apply exactly what we calculated above
-                    current_logits[k] -= (alpha * final_grads[k])
-
-                # C. History Update
-                if progressive:
-                    with torch.no_grad():
-                        # Re-extract from UPDATED logits
-                        norm_vec_new, qual_new = extract_feature_vector_phasor(
-                            current_logits[k].unsqueeze(0),
-                            mask_index[k].unsqueeze(0),
-                            x[k].unsqueeze(0),
-                            embedding_matrix, kernel_target, pooling_method
-                        )
-
-                        if strategy == "gram_schmidt" or strategy == "sequential_subtraction":
-                            # Add ORTHOGONAL component to basis
-                            # Note: Sequential Subtraction benefits from GS orthogonalization for the history basis
-                            v_perp = norm_vec_new.clone()
-                            for q in history_vecs:
-                                proj = torch.dot(norm_vec_new.view(-1), q.view(-1)) * q
-                                v_perp = v_perp - proj
-
-                            resid = torch.norm(v_perp, p=2)
-                            if resid > 1e-6:
-                                history_vecs.append(v_perp / resid)
-                        else:
-                            history_vecs.append(norm_vec_new)
-                            history_qualities.append(qual_new.item())
-                else:
-                    # Non-progressive: Use original vectors
-                    if strategy == "gram_schmidt":
-                        v_perp = norm_vec_k.detach().clone()
-                        for q in history_vecs:
-                            proj = torch.dot(v_perp.view(-1), q.view(-1)) * q
-                            v_perp = v_perp - proj
-                        resid = torch.norm(v_perp)
-                        if resid > 1e-6: history_vecs.append(v_perp / resid)
-                    else:
-                        history_vecs.append(norm_vec_k.detach())
-                        history_qualities.append(qual_k.item())
-
-    update = alpha * final_grads
-    metadata["force_map"] = torch.norm(update, p=2, dim=-1).detach().float().cpu()
-
-    return logits - update, metadata
-
 
 def calculate_diversity_score(eval_model, texts):
     if len(texts) < 2: return 0.0
