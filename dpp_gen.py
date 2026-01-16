@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from sentence_transformers import SentenceTransformer, util
 from transformers import AutoModel, AutoTokenizer, BitsAndBytesConfig
 
+
 def compute_entropy_metadata(logits, entropy_threshold):
     """
     Computes entropy map and gating mechanism.
@@ -135,36 +136,6 @@ def _normalize_gradient(grad, protected_tokens=None):
     return grad_safe
 
 
-def _step_gram_schmidt(logit_k, norm_vec_k, quality_k, basis_vectors, quality_scale):
-    """
-    Calculates the gradient to MINIMIZE similarity with history.
-    Uses dot-product formulation to avoid zero-gradients at perfect overlap.
-    """
-    # We want to minimize the sum of squared cosine similarities.
-    # Loss = Sum( (v . q)^2 )
-
-    similarity_loss = torch.tensor(0.0, device=logit_k.device)
-
-    for q in basis_vectors:
-        # q is the history vector (detached)
-        # norm_vec_k is the current vector (attached to graph)
-
-        # Flatten [Batch, 2*Vocab] -> [1D] for dot product
-        dot = torch.dot(norm_vec_k.view(-1), q.view(-1))
-
-        # We square it to penalize alignment in either direction (+/-)
-        similarity_loss = similarity_loss + (dot ** 2)
-
-    # We want to MINIMIZE this loss.
-    # The optimization loop performs Gradient Descent (logits -= grad).
-    # So we simply return the gradient of the loss we want to minimize.
-
-    # Apply Quality Weighting (Only push if model is confident)
-    weighted_loss = similarity_loss * (quality_scale * quality_k)
-
-    return torch.autograd.grad(weighted_loss, logit_k)[0]
-
-
 # def _step_gram_schmidt(logit_k, norm_vec_k, quality_k, basis_vectors, quality_scale):
 #     v_perp = norm_vec_k.clone()
 #     for q in basis_vectors:
@@ -197,6 +168,81 @@ def _step_sequential_logdet(logit_k, norm_vec_k, quality_k, previous_vecs, previ
     return torch.autograd.grad(loss, logit_k)[0]
 
 
+
+def _step_gram_schmidt(logit_k, norm_vec_k, quality_k, basis_vectors, quality_scale):
+    """
+    Calculates the gradient to MINIMIZE similarity with history.
+    Uses dot-product formulation to avoid zero-gradients at perfect overlap.
+    """
+    # We want to minimize the sum of squared cosine similarities.
+    # Loss = Sum( (v . q)^2 )
+
+    similarity_loss = torch.tensor(0.0, device=logit_k.device)
+
+    for q in basis_vectors:
+        # q is the history vector (detached)
+        # norm_vec_k is the current vector (attached to graph)
+
+        # Flatten [Batch, 2*Vocab] -> [1D] for dot product
+        dot = torch.dot(norm_vec_k.view(-1), q.view(-1))
+
+        # We square it to penalize alignment in either direction (+/-)
+        similarity_loss = similarity_loss + (dot ** 2)
+
+    # We want to MINIMIZE this loss.
+    # The optimization loop performs Gradient Descent (logits -= grad).
+    # So we simply return the gradient of the loss we want to minimize.
+
+    # Apply Quality Weighting (Only push if model is confident)
+    weighted_loss = similarity_loss * (quality_scale * quality_k)
+
+    return torch.autograd.grad(weighted_loss, logit_k)[0]
+
+
+
+
+def _step_sequential_subtraction(logit_k, mask_k, x_k, embedding_matrix, kernel_target, pooling_method, history_vecs,
+                                 quality_scale, alpha):
+    """
+    New Approach: Iterative/Sequential Subtraction (Lookahead).
+    Calculates the effective gradient by sequentially dodging each history item.
+    """
+    # Start with a clone of the logits that we can mutate
+    curr_logits = logit_k.clone()
+
+    # We iterate through history, updating the logits at each step
+    # This prevents the "Blind Spot" where we ignore orthogonal constraints
+    for q in history_vecs:
+        # Re-attach gradient to the current (shifted) state
+        curr_logits = curr_logits.detach().requires_grad_(True)
+
+        # 1. Re-evaluate feature vector at the CURRENT position
+        norm_vec, qual = extract_feature_vector_phasor(
+            curr_logits, mask_k, x_k, embedding_matrix, kernel_target, pooling_method
+        )
+
+        # 2. Calculate Gradient vs current history item q
+        # Loss = (v . q)^2
+        dot = torch.dot(norm_vec.view(-1), q.view(-1))
+        loss = (dot ** 2) * (quality_scale * qual)
+
+        grad = torch.autograd.grad(loss, curr_logits)[0]
+
+        # 3. Update immediately (Lookahead step)
+        with torch.no_grad():
+            curr_logits = curr_logits - (alpha * grad)
+
+    # Return the total effective gradient (Total Displacement / Alpha)
+    # This allows the main loop to apply it using the standard `logits -= alpha * grad` pattern
+    total_displacement = logit_k - curr_logits
+
+    # Avoid division by zero if alpha is tiny
+    if alpha < 1e-6:
+        return torch.zeros_like(logit_k)
+
+    return total_displacement / alpha
+
+
 def apply_dpp_guidance(
         logits,
         mask_index,
@@ -207,7 +253,7 @@ def apply_dpp_guidance(
         protected_tokens=None,
         kernel_target="logits",
         embedding_matrix=None,
-        strategy='gram_schmidt',  # 'joint', 'sequential', 'gram_schmidt'
+        strategy='gram_schmidt',  # 'joint', 'sequential', 'gram_schmidt', 'sequential_subtraction'
         progressive=True,  # Re-compute features after every update?
         pooling_method='max'
 ):
@@ -251,7 +297,7 @@ def apply_dpp_guidance(
 
             final_grads = _normalize_gradient(raw_grads, protected_tokens)
 
-            final_grads = final_grads # * meta["per_sample_gate"].unsqueeze(-1)
+            final_grads = final_grads  # * meta["per_sample_gate"].unsqueeze(-1)
 
         else:
             for k in range(logits.shape[0]):
@@ -275,10 +321,23 @@ def apply_dpp_guidance(
                         grad_k = _step_sequential_logdet(
                             logit_k, norm_vec_k, qual_k, prev_v_stack, prev_q_stack, quality_scale
                         )
+                    elif strategy == "sequential_subtraction":
+                        # New Strategy Integration
+                        grad_k = _step_sequential_subtraction(
+                            logit_k,
+                            mask_index[k].unsqueeze(0),
+                            x[k].unsqueeze(0),
+                            embedding_matrix,
+                            kernel_target,
+                            pooling_method,
+                            history_vecs,
+                            quality_scale,
+                            alpha
+                        )
 
                     # Normalize (Max Norm) and Gate
                     grad_k_norm = _normalize_gradient(grad_k.squeeze(0), protected_tokens)
-                    final_grads[k] = grad_k_norm # * meta["per_sample_gate"][k]
+                    final_grads[k] = grad_k_norm  # * meta["per_sample_gate"][k]
 
                 # B. Progressive Update
                 if progressive and k > 0:
@@ -296,8 +355,9 @@ def apply_dpp_guidance(
                             embedding_matrix, kernel_target, pooling_method
                         )
 
-                        if strategy == "gram_schmidt":
+                        if strategy == "gram_schmidt" or strategy == "sequential_subtraction":
                             # Add ORTHOGONAL component to basis
+                            # Note: Sequential Subtraction benefits from GS orthogonalization for the history basis
                             v_perp = norm_vec_new.clone()
                             for q in history_vecs:
                                 proj = torch.dot(norm_vec_new.view(-1), q.view(-1)) * q
@@ -375,7 +435,6 @@ def run_generation(model,
                    tokenizer,
                    pool,
                    target):
-
     messages = [{"role": "user", "content": prompt}]
     prompt_str = tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
 
