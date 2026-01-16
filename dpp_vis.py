@@ -5,17 +5,14 @@ import torch.nn.functional as F
 import numpy as np
 from transformers import AutoModel, AutoTokenizer, BitsAndBytesConfig
 
-# Import logic from your existing files
 from dpp_gen import (
     apply_dpp_guidance,
     get_num_transfer_tokens,
     add_gumbel_noise
 )
 
-# -----------------------------------------------------------------------------
-# 1. SETUP
-# -----------------------------------------------------------------------------
 MODEL_ID = "GSAI-ML/LLaDA-8B-Instruct"
+
 
 def load_model():
     print(f"Loading {MODEL_ID}...")
@@ -40,17 +37,17 @@ def load_model():
 
     return model, tokenizer, mask_token_id
 
-# -----------------------------------------------------------------------------
-# 2. RICH DATA CAPTURE HELPER
-# -----------------------------------------------------------------------------
+
 def capture_top_k(logits, k=5):
     vals, indices = torch.topk(logits, k)
     return indices.tolist(), vals.tolist()
+
 
 def capture_top_k_abs(tensor, k=5):
     vals, indices = torch.topk(tensor.abs(), k)
     signed_vals = tensor[indices]
     return indices.tolist(), signed_vals.tolist()
+
 
 def decode_top_k(indices, vals, tokenizer):
     decoded = []
@@ -59,16 +56,13 @@ def decode_top_k(indices, vals, tokenizer):
         decoded.append({"t": token_str, "v": round(val, 2)})
     return decoded
 
-# -----------------------------------------------------------------------------
-# 3. GENERATION WITH DEEP LOGGING
-# -----------------------------------------------------------------------------
+
 @torch.no_grad()
 def run_rich_generation(
         prompt, model, tokenizer, mask_token_id,
         batch_size=4, steps=32, gen_length=64,
         alpha=5.0, quality_scale=1.0, entropy_thresh=0.1, temperature=1.0
 ):
-    # Setup
     messages = [{"role": "user", "content": prompt}]
     prompt_str = tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
     encoded = tokenizer([prompt_str] * batch_size, return_tensors="pt", padding=True, add_special_tokens=False)
@@ -77,7 +71,6 @@ def run_rich_generation(
     attention_mask = encoded.attention_mask.to(model.device)
     prompt_len = prompt_ids.shape[1]
 
-    # Initialize Canvas
     x = torch.full((batch_size, prompt_len + gen_length), mask_token_id, dtype=torch.long).to(model.device)
     x[:, :prompt_len] = prompt_ids.clone()
 
@@ -90,23 +83,21 @@ def run_rich_generation(
     print(f"Generating '{prompt[:30]}...' ({steps} steps)")
 
     for i in range(steps):
-        print(f"  Step {i+1}/{steps}...", end="\r")
+        print(f"  Step {i + 1}/{steps}...", end="\r")
 
         mask_index = (x == mask_token_id)
         logits = model(x, attention_mask=attention_mask).logits
 
         gen_logits_pre = logits[:, prompt_len:, :].clone()
 
-        # 2. DPP Guidance
         curr_alpha = alpha * (1 - (i / steps))
 
         metadata = {"gate": 0.0, "entropy_map": [], "force_map": []}
         update_tensor = torch.zeros_like(gen_logits_pre)
 
-        # Calculate 'Pre-Guidance' Winners (to detect flips)
         top1_pre = gen_logits_pre.argmax(dim=-1)
 
-        if curr_alpha > 0.01:
+        if curr_alpha > 0.0:
             gen_logits_post, metadata = apply_dpp_guidance(
                 gen_logits_pre,
                 mask_index=mask_index[:, prompt_len:],
@@ -124,14 +115,12 @@ def run_rich_generation(
         else:
             gen_logits_post = gen_logits_pre
 
-        # Calculate 'Post-Guidance' Winners
         top1_post = gen_logits_post.argmax(dim=-1)
 
-        # Detect Flips: Where did DPP change the top choice?
-        # (Only counts if the token was MASKED)
+        # Detect where DPP flipped
         flips = (top1_pre != top1_post) & mask_index[:, prompt_len:]
 
-        # 3. Sampling Logic (Determines unmasking)
+        # sampling logic from original LLADA generate.py, without semi-AR and with low conf. remasking
         logits_noisy = add_gumbel_noise(logits, temperature=temperature)
         x0 = torch.argmax(logits_noisy, dim=-1)
 
@@ -140,7 +129,6 @@ def run_rich_generation(
         x0 = torch.where(mask_index, x0, x)
         confidence = torch.where(mask_index, x0_p, torch.tensor(-np.inf).to(x0_p.device))
 
-        # Calculate which tokens are unmasked THIS STEP
         transfer_index = torch.zeros_like(x0, dtype=torch.bool)
         for j in range(batch_size):
             k_trans = num_transfer_tokens_schedule[j, i]
@@ -148,12 +136,8 @@ def run_rich_generation(
                 _, select_index = torch.topk(confidence[j], k=k_trans)
                 transfer_index[j, select_index] = True
 
-        # Determine newly unmasked indices relative to prompt_len
-        # transfer_index is [Batch, Full_Seq]
-        # We need it relative to [Batch, Gen_Seq]
         newly_unmasked_mask = transfer_index[:, prompt_len:]
 
-        # --- LOGGING ---
         frame_data = {
             "step": i,
             "alpha": float(curr_alpha),
@@ -181,19 +165,16 @@ def run_rich_generation(
                     token_str = "░"
                 else:
                     token_str = tokenizer.decode([tid]).replace("Ġ", " ").replace("\n", "⏎")
-                    #if tokenizer.mask_token in token_str: token_str = "░"
+                    # if tokenizer.mask_token in token_str: token_str = "░"
 
                 batch_info["tokens"].append(token_str)
 
-                # Metadata Flags
                 is_new = newly_unmasked_mask[b, t_idx].item()
                 is_flip = flips[b, t_idx].item()
 
                 batch_info["is_new"].append(is_new)
                 batch_info["is_flip"].append(is_flip)
 
-                # Capture details
-                # Condition: Masked, Newly Unmasked, Flipped, or High Force
                 is_masked = (tid == mask_token_id)
                 force_mag = b_force[t_idx] if t_idx < len(b_force) else 0.0
 
@@ -219,15 +200,12 @@ def run_rich_generation(
 
         history.append(frame_data)
 
-        # Apply Update
         x[transfer_index] = x0[transfer_index]
 
     print("\nGeneration Complete.")
     return history
 
-# -----------------------------------------------------------------------------
-# 4. HTML GENERATOR
-# -----------------------------------------------------------------------------
+
 def save_rich_dashboard(history, filename="dpp_rich_dashboard.html"):
     json_data = json.dumps(history)
 
@@ -336,7 +314,7 @@ def save_rich_dashboard(history, filename="dpp_rich_dashboard.html"):
             <h3>DPP Rich Dashboard</h3>
             <div style="display:flex; gap:10px; margin-left:auto;">
                 <button id="playBtn">Play</button>
-                <input type="range" id="slider" min="0" max="{len(history)-1}" value="0">
+                <input type="range" id="slider" min="0" max="{len(history) - 1}" value="0">
                 <span id="stepLabel" style="font-family:monospace; min-width: 80px;">Step 0</span>
             </div>
         </div>
@@ -479,9 +457,7 @@ def save_rich_dashboard(history, filename="dpp_rich_dashboard.html"):
         f.write(html_content)
     print(f"\nDashboard saved to {filename}")
 
-# -----------------------------------------------------------------------------
-# 5. MAIN
-# -----------------------------------------------------------------------------
+
 if __name__ == "__main__":
     PROMPT = "Write a python function to compute fibonacci."
 
@@ -495,8 +471,8 @@ if __name__ == "__main__":
         batch_size=4,
         steps=32,
         gen_length=64,
-        alpha=10.0, 
-        quality_scale=0.1# High alpha to ensure we see flips
+        alpha=10.0,
+        quality_scale=0.1
     )
 
     save_rich_dashboard(history)

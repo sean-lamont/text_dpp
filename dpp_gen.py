@@ -8,11 +8,6 @@ import torch.nn.functional as F
 from sentence_transformers import SentenceTransformer, util
 from transformers import AutoModel, AutoTokenizer, BitsAndBytesConfig
 
-
-# -----------------------------------------------------------------------------
-# 1. HELPER FUNCTIONS
-# -----------------------------------------------------------------------------
-
 def compute_entropy_metadata(logits, entropy_threshold):
     """
     Computes entropy map and gating mechanism.
@@ -21,7 +16,6 @@ def compute_entropy_metadata(logits, entropy_threshold):
     log_probs = torch.log_softmax(logits, dim=-1)
     entropy_map = -torch.sum(probs * log_probs, dim=-1)
 
-    # Gate calculation
     pooled_entropy = entropy_map.mean(dim=1, keepdim=True)
     gate = torch.sigmoid((pooled_entropy - entropy_threshold) * 10.0)
 
@@ -87,7 +81,7 @@ def extract_feature_vector(logit_k, mask_k, x_k, embedding_matrix, kernel_target
 
     probs_in_ = torch.softmax(logit_k, dim=-1)
 
-    # Mixed Representation
+    # set the probs for already established tokens to be one-hot for their selection
     probs_in = torch.zeros_like(probs_in_)
     probs_in[mask_k] = probs_in_[mask_k]
 
@@ -95,14 +89,12 @@ def extract_feature_vector(logit_k, mask_k, x_k, embedding_matrix, kernel_target
         one_hot_tokens = F.one_hot(x_k[~mask_k], num_classes=probs_in.shape[-1])
         probs_in[~mask_k] = one_hot_tokens.to(dtype=probs_in.dtype)
 
-    # Projection
     if kernel_target == "embeddings" and embedding_matrix is not None:
         W = embedding_matrix.to(probs_in.device).detach()
         features = torch.matmul(probs_in, W)
     else:
         features = probs_in
 
-    # Pooling
     if pooling_method == "max":
         vecs = features.max(dim=1).values
     else:
@@ -125,18 +117,15 @@ def _normalize_gradient(grad, protected_tokens=None):
     Standardizes gradient normalization (Max Norm) to ensure consistency
     between progressive updates and the final return.
     """
-    # 1. Zero out protected tokens
+
     if protected_tokens is not None:
         if grad.dim() == 3:  # [Batch, Seq, Vocab]
             grad.index_fill_(2, protected_tokens, 0.0)
         elif grad.dim() == 2:  # [Seq, Vocab] (Single item case)
             grad.index_fill_(1, protected_tokens, 0.0)
 
-    # 2. Compute Norms per token
-    # shape: [Batch, Seq, 1] or [Seq, 1]
     token_norms = torch.norm(grad, p=2, dim=-1, keepdim=True)
 
-    # 3. Compute Max Norm over the sequence
     # This preserves relative magnitude between tokens in the sequence.
     # If token A has norm 0.1 and token B has 0.01, A gets scaled to 1.0, B to 0.1
     max_val_dim = 1 if grad.dim() == 3 else 0
@@ -234,10 +223,9 @@ def apply_dpp_guidance(
     metadata["gate"] = meta["gate"]
     metadata["entropy_map"] = meta["entropy_map"]
 
-    if meta["gate"] < 0.05:
-        return logits, metadata
+    # if meta["gate"] < 0.05:
+    #     return logits, metadata
 
-    # 2. Init
     current_logits = logits.clone().detach()
     final_grads = torch.zeros_like(logits)
 
@@ -245,8 +233,6 @@ def apply_dpp_guidance(
     history_qualities = []
 
     with torch.enable_grad():
-
-        # --- JOINT STRATEGY ---
         if strategy == "joint":
             logits_in = logits.detach().clone().requires_grad_(True)
             norm_vecs, quals = extract_feature_vector(
@@ -263,13 +249,10 @@ def apply_dpp_guidance(
             loss = -(torch.logdet(L + jitter * identity) - torch.logdet(L + identity + jitter * identity))
             raw_grads = torch.autograd.grad(loss, logits_in)[0]
 
-            # Normalize Jointly
             final_grads = _normalize_gradient(raw_grads, protected_tokens)
 
-            # Apply Gate
-            final_grads = final_grads * meta["per_sample_gate"].unsqueeze(-1)
+            final_grads = final_grads # * meta["per_sample_gate"].unsqueeze(-1)
 
-        # --- SEQUENTIAL / GRAM-SCHMIDT ---
         else:
             for k in range(logits.shape[0]):
 
@@ -295,7 +278,7 @@ def apply_dpp_guidance(
 
                     # Normalize (Max Norm) and Gate
                     grad_k_norm = _normalize_gradient(grad_k.squeeze(0), protected_tokens)
-                    final_grads[k] = grad_k_norm * meta["per_sample_gate"][k]
+                    final_grads[k] = grad_k_norm # * meta["per_sample_gate"][k]
 
                 # B. Progressive Update
                 if progressive and k > 0:
@@ -339,7 +322,6 @@ def apply_dpp_guidance(
                         history_vecs.append(norm_vec_k.detach())
                         history_qualities.append(qual_k.item())
 
-    # 3. Final Update
     update = alpha * final_grads
     metadata["force_map"] = torch.norm(update, p=2, dim=-1).detach().float().cpu()
 
@@ -393,6 +375,7 @@ def run_generation(model,
                    tokenizer,
                    pool,
                    target):
+
     messages = [{"role": "user", "content": prompt}]
     prompt_str = tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
 
