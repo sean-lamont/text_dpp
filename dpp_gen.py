@@ -176,18 +176,8 @@ def apply_dpp_guidance(
                         top_k=5
                     )
 
-                    if strategy == "gram_schmidt" or strategy == "sequential_subtraction":
-                        v_perp = norm_vec_new.clone()
-                        for q in history_vecs:
-                            proj = torch.dot(norm_vec_new.view(-1), q.view(-1)) * q
-                            v_perp = v_perp - proj
-
-                        resid = torch.norm(v_perp, p=2)
-                        if resid > 1e-6:
-                            history_vecs.append(v_perp / resid)
-                    else:
-                        history_vecs.append(norm_vec_new)
-                        history_qualities.append(qual_new.item())
+                    history_vecs.append(norm_vec_new)
+                    history_qualities.append(qual_new.item())
 
     update = alpha * final_grads
     metadata["force_map"] = torch.norm(update, p=2, dim=-1).detach().float().cpu()
