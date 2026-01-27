@@ -71,9 +71,9 @@ def run_gsm8k_benchmark(n_problems=20, configs=[]):
                 quality=cfg['quality'],
                 pool=cfg['pool'],
                 target=cfg['target'],
-                entropy_thresh=0.6,
                 tokenizer=tokenizer,
-                temperature=cfg['temp']
+                temperature=cfg['temp'],
+                strategy=cfg.get('strategy', 'sequential_subtraction')
             )
 
             for j, s in enumerate(samples):
@@ -116,30 +116,37 @@ def run_gsm8k_benchmark(n_problems=20, configs=[]):
 if __name__ == "__main__":
     settings = [
         {
-            "name": "Baseline (No DPP)",
-            "alpha": 0.0, "quality": 0.0, "pool": "mean", "target": "logits", "temp": 1
+            "name": "Baseline (No DPP, temp=0.5)",
+            "alpha": 0.0, "quality": 0.0, "pool": "mean", "target": "logits", "temp": 0.5
         },
         {
-            "name": "DPP (Logits, Alpha=3.0, max)",
-            "alpha": 3.0, "quality": 1.0, "pool": "max", "target": "logits", "temp": 1
+            "name": "Baseline (No DPP, temp=1.0)",
+            "alpha": 0.0, "quality": 0.0, "pool": "mean", "target": "logits", "temp": 1.0
         },
         {
-            "name": "DPP (Logits, Alpha=5.0, max)",
-            "alpha": 5.0, "quality": 1.0, "pool": "max", "target": "logits", "temp": 1
+            "name": "Baseline (No DPP, temp=1.5)",
+            "alpha": 0.0, "quality": 0.0, "pool": "mean", "target": "logits", "temp": 1.5
         },
         {
-            "name": "DPP (Logits, Alpha=10.0, max)",
-            "alpha": 10.0, "quality": 1.0, "pool": "max", "target": "logits", "temp": 1
+            "name": "DPP (Logits, Alpha=0.5, positional, logits, seq_sub)",
+            "alpha": 0.5, "quality": 1.0, "pool": "positional", "target": "embeddings", "temp": 0
         },
         {
-            "name": "DPP (Logits, Alpha=20.0, max)",
-            "alpha": 20.0, "quality": 1.0, "pool": "max", "target": "logits", "temp": 1
+            "name": "DPP (Logits, Alpha=2.0, positional, logits, seq_sub)",
+            "alpha": 2.0, "quality": 1.0, "pool": "positional", "target": "embeddings", "temp": 0
         },
         {
-            "name": "DPP (Logits, Alpha=20.0, max)",
-            "alpha": 100.0, "quality": 1.0, "pool": "max", "target": "logits", "temp": 1
+            "name": "DPP (Logits, Alpha=3.0, positional, logits, seq_sub)",
+            "alpha": 3.0, "quality": 1.0, "pool": "positional", "target": "embeddings", "temp": 0
         },
-
+        {
+            "name": "DPP (Logits, Alpha=5.0, positional, logits, seq_sub)",
+            "alpha": 5.0, "quality": 1.0, "pool": "positional", "target": "embeddings", "temp": 0
+        },
+        {
+            "name": "DPP (Logits, Alpha=8.0, positional, logits, seq_sub)",
+            "alpha": 8.0, "quality": 1.0, "pool": "positional", "target": "embeddings", "temp": 0
+        },
     ]
 
     run_gsm8k_benchmark(n_problems=100, configs=settings)

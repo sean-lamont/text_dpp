@@ -16,7 +16,7 @@ def compute_entropy_metadata(logits):
 
 
 def extract_feature_vector(logit_k, mask_k, x_k, embedding_matrix, kernel_target='logits', pooling_method='max',
-                           top_k=5, seq_len_scale=64):
+                           top_k=0, seq_len_scale=64):
     """
     Extracts the feature vector and quality score for a single batch item
     or the whole batch.
@@ -92,8 +92,8 @@ def apply_dpp_guidance(
         kernel_target="logits",
         embedding_matrix=None,
         strategy='sequential_subtraction',
-        progressive=True,
-        pooling_method='positional'
+        pooling_method='positional',
+        top_k=0  # <0 for full vec
 ):
     metadata = {
         "entropy_map": [],
@@ -111,6 +111,7 @@ def apply_dpp_guidance(
     history_vecs = []
     history_qualities = []
 
+    # joint seems to make k 'modes' (in random order) where the model repeats those k. Higher alpha gives more k
     with torch.enable_grad():
         if strategy == "joint":  # simplest approach, moves all points simultaneously with logdet loss from diverseflow
             logits_in = logits.detach().clone().requires_grad_(True)
@@ -133,7 +134,7 @@ def apply_dpp_guidance(
                 norm_vec_k, qual_k = extract_feature_vector(
                     logit_k, mask_index[k].unsqueeze(0), x[k].unsqueeze(0),
                     embedding_matrix, kernel_target, pooling_method,
-                    top_k=5
+                    top_k=top_k
                 )
 
                 if k > 0:
@@ -157,12 +158,15 @@ def apply_dpp_guidance(
                             pooling_method,
                             history_vecs,
                             quality_scale,
-                            alpha
+                            alpha,
+                            protected_tokens
+                        )
+                    elif strategy == "orthogonal_projection":
+                        grad_k = _step_orthogonal_projection(
+                            logit_k, norm_vec_k, qual_k, history_vecs, quality_scale, protected_tokens
                         )
 
-                    # todo normalisation here vs sequential sub?
-                    grad_k_norm = _normalize_gradient(grad_k.squeeze(0), protected_tokens)
-                    final_grads[k] = grad_k_norm
+                    final_grads[k] = grad_k.squeeze(0)
 
                 if k > 0:
                     current_logits[k] -= (alpha * final_grads[k])
@@ -173,7 +177,7 @@ def apply_dpp_guidance(
                         mask_index[k].unsqueeze(0),
                         x[k].unsqueeze(0),
                         embedding_matrix, kernel_target, pooling_method,
-                        top_k=5
+                        top_k=top_k
                     )
 
                     history_vecs.append(norm_vec_new)
@@ -181,6 +185,8 @@ def apply_dpp_guidance(
 
     update = alpha * final_grads
     metadata["force_map"] = torch.norm(update, p=2, dim=-1).detach().float().cpu()
+
+    return logits - update, metadata
 
 
 def _normalize_gradient(grad, protected_tokens=None):
@@ -205,9 +211,10 @@ def _normalize_gradient(grad, protected_tokens=None):
     return grad_safe
 
 
-def _step_sequential_logdet(logit_k, norm_vec_k, quality_k, previous_vecs, previous_qualities, quality_scale):
+def _step_sequential_logdet(logit_k, norm_vec_k, quality_k, previous_vecs, previous_qualities, quality_scale,
+                            protected_tokens=None):
     all_vecs = torch.cat([previous_vecs, norm_vec_k], dim=0)
-    all_quals = torch.cat([previous_qualities, quality_k.unsqueeze(0)], dim=0)
+    all_quals = torch.cat([previous_qualities, quality_k], dim=0)
 
     K_sub = torch.mm(all_vecs, all_vecs.t())
     identity = torch.eye(K_sub.shape[0], device=K_sub.device)
@@ -220,10 +227,61 @@ def _step_sequential_logdet(logit_k, norm_vec_k, quality_k, previous_vecs, previ
     term2 = torch.logdet(L_sub + identity + jitter * identity)
     loss = -(term1 - term2)
 
-    return torch.autograd.grad(loss, logit_k)[0]
+    raw_grads = torch.autograd.grad(loss, logit_k)[0]
+
+    return _normalize_gradient(raw_grads, protected_tokens)
 
 
-def _step_gram_schmidt(logit_k, norm_vec_k, quality_k, basis_vectors, quality_scale):
+def _step_orthogonal_projection(logit_k, norm_vec_k, quality_k, history_vecs, quality_scale, protected_tokens=None):
+    """
+    Finds the direction orthogonal to the span of ALL previous history vectors
+    and optimizes the logits to align with that 'fresh' direction.
+    """
+    # 1. Build an orthogonal basis for the history (Gram-Schmidt)
+    # We do this on-the-fly so we handle correlated history correctly
+    # without subtracting the same component multiple times.
+    ortho_basis = []
+    for q in history_vecs:
+        u = q.clone()
+        for b in ortho_basis:
+            # Subtract projection onto existing basis vectors
+            u = u - torch.dot(u.view(-1), b.view(-1)) * b
+
+        u_norm = torch.norm(u)
+        if u_norm > 1e-6:
+            ortho_basis.append(u / u_norm)
+
+    # 2. Compute the residual of the current vector against this basis
+    # This represents the component of the current state that is purely "new".
+    # v_residual = v - sum(proj_b(v))
+    # We detach because we treat this direction as a fixed target.
+    v_target = norm_vec_k.detach().clone()
+
+    for b in ortho_basis:
+        proj = torch.dot(v_target.view(-1), b.view(-1)) * b
+        v_target = v_target - proj
+
+    # 3. Normalize to get the target direction vector
+    target_norm = torch.norm(v_target)
+    if target_norm < 1e-6:
+        # The current state is fully spanned by history (no new direction exists)
+        return torch.zeros_like(logit_k)
+
+    target_dir = v_target / target_norm
+
+    # 4. Optimize: Maximize alignment with this "Pure" direction
+    # Loss = - (Current_Vector . Target_Direction)
+    alignment = torch.dot(norm_vec_k.view(-1), target_dir.view(-1))
+    loss = -alignment * (quality_scale * quality_k)
+
+    if loss.requires_grad:
+        raw_grads = torch.autograd.grad(loss, logit_k)[0]
+        return _normalize_gradient(raw_grads, protected_tokens)
+
+    return torch.zeros_like(logit_k)
+
+
+def _step_gram_schmidt(logit_k, norm_vec_k, quality_k, basis_vectors, quality_scale, protected_tokens=None):
     """
     Calculates the gradient to MINIMIZE similarity with history.
     Uses dot-product formulation to avoid zero-gradients at perfect overlap, which breaks for logdet.
@@ -239,11 +297,14 @@ def _step_gram_schmidt(logit_k, norm_vec_k, quality_k, basis_vectors, quality_sc
 
     weighted_loss = similarity_loss * (quality_scale * quality_k)
 
-    return torch.autograd.grad(weighted_loss, logit_k)[0]
+    raw_grads = torch.autograd.grad(weighted_loss, logit_k)[0]
+
+    final_grads = _normalize_gradient(raw_grads, protected_tokens)
+    return final_grads
 
 
 def _step_sequential_subtraction(logit_k, mask_k, x_k, embedding_matrix, kernel_target, pooling_method, history_vecs,
-                                 quality_scale, alpha):
+                                 quality_scale, alpha, protected_tokens):
     """
      Iterative/Sequential Updates. Multiple internal updates, step logits against each history item so the next step
      is aware of current state of logits. Prevents logits moving to previously visited space, which is possible when
@@ -266,7 +327,7 @@ def _step_sequential_subtraction(logit_k, mask_k, x_k, embedding_matrix, kernel_
         loss = (dot ** 2) * (quality_scale * qual)
 
         grad = torch.autograd.grad(loss, curr_logits)[0]
-
+        grad = _normalize_gradient(grad, protected_tokens)
         with torch.no_grad():
             curr_logits = curr_logits - (alpha * grad)
 
@@ -327,7 +388,9 @@ def run_generation(model,
                    temperature,
                    tokenizer,
                    pool,
-                   target):
+                   target,
+                   strategy='sequential_subtraction',
+                   top_k=0):
     '''
     Main generation function. Follows pattern from LLADA generate.py, however includes DPP guidance if alpha > 0,
     and logging for DPP process.
@@ -380,7 +443,9 @@ def run_generation(model,
                 mask_index=mask_index[:, prompt_len:],
                 x=x[:, prompt_len:],
                 embedding_matrix=embedding_matrix,
-                pooling_method=pool
+                pooling_method=pool,
+                strategy=strategy,
+                top_k=top_k
             )
 
             logits[:, prompt_len:, :] = gen_logits_guided
