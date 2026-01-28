@@ -10,12 +10,17 @@ from transformers import AutoModel, AutoTokenizer, BitsAndBytesConfig
 from dpp_gen import load_model
 from dpp_core import FeatureExtractor, get_strategy, DPPGenerator
 
+from hydra import compose, initialize
+from hydra.core.global_hydra import GlobalHydra
+
 # Helper to load config without hydra.main decorator for Streamlit
 def load_config():
-    # This is a bit hacky for Streamlit, ideally we'd use hydra compose API
-    # But for simplicity, let's just create a default config object or load from yaml manually
-    # Here we will just use a default dict for the app's initial state
-    return OmegaConf.load("conf/config.yaml")
+    if GlobalHydra.instance().is_initialized():
+        GlobalHydra.instance().clear()
+    
+    with initialize(version_base=None, config_path="conf"):
+        cfg = compose(config_name="config")
+    return cfg
 
 @st.cache_resource
 def get_model_resources():

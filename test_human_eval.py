@@ -23,13 +23,11 @@ def main(cfg: DictConfig):
     model, tokenizer, embedding_matrix, mask_token_id = load_model(cfg)
 
     print("Loading dataset...")
-    try:
-        dataset = load_dataset("openai/openai_humaneval", split="test")
-    except:
-        dataset = load_dataset("openai_humaneval", split="test")
+    dataset = load_dataset("openai/openai_humaneval", split="test")
 
     # Limit problems if needed, e.g. via cfg
-    n_problems = 20 # or cfg.n_problems
+    n_problems = len(dataset) # or cfg.n_problems
+
     problems = [dataset[i] for i in range(min(n_problems, len(dataset)))]
 
     print(f"Starting Generation for {len(problems)} problems...")

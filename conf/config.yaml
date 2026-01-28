@@ -1,6 +1,6 @@
 defaults:
   - model: llada
-  - strategy: sequential_subtraction
+  - strategy: joint
   - _self_
 
 prompt: "Write a python function to compute fibonacci."

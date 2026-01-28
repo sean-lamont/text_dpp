@@ -116,13 +116,6 @@ class SequentialSubtractionStrategy(DPPStrategy):
         current_logits = logits.clone().detach()
         final_grads = torch.zeros_like(logits)
 
-        # For sequential subtraction, we iterate through history for each batch item
-        # But here we assume the batch dimension is the "k" items we are optimizing sequentially if history is empty?
-        # Or are we optimizing against history?
-        # The original code optimized item k against items 0..k-1 AND history if provided (though original code didn't take external history for batch optimization)
-
-        # Re-implementing the logic from dpp_gen.py which handles batch as the set to diversify
-
         local_history_vecs = list(history_vecs)
         local_history_qualities = list(history_qualities)
 
@@ -277,20 +270,9 @@ class JointStrategy(DPPStrategy):
               protected_tokens: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Dict]:
 
         metadata = {"entropy_map": [], "force_map": []}
-        # Joint strategy typically works on the whole batch at once
-        # It doesn't easily support external history in the same way as sequential without modifying the kernel matrix
 
         logits_in = logits.detach().clone().requires_grad_(True)
         norm_vecs, quals = self.feature_extractor.extract(logits_in, mask_index, x)
-
-        # If we have history, we should append it to the kernel calculation?
-        # For simplicity, let's assume JointStrategy primarily diversifies the current batch
-        # But we can concatenate history vectors if needed.
-
-        if history_vecs:
-             # This is a simplification. True joint optimization with fixed history would involve conditional DPPs.
-             # Here we just optimize the batch to be diverse within itself.
-             pass
 
         K = torch.mm(norm_vecs, norm_vecs.t())
         identity = torch.eye(K.shape[0], device=K.device)
@@ -362,11 +344,6 @@ class DPPGenerator:
         protected_tokens = torch.tensor([self.tokenizer.eos_token_id, self.tokenizer.pad_token_id], device=self.device)
 
         history_frames = []
-
-        # History for DPP across steps? No, usually DPP is applied per step on the candidates.
-        # But wait, the original code had `history_vecs` in `apply_dpp_guidance` but it was initialized empty inside the function unless passed?
-        # In `run_generation` of `dpp_gen.py`, `apply_dpp_guidance` is called. It initializes `history_vecs = []` inside if not passed.
-        # And `run_generation` does NOT pass history between steps. So it's only diversifying the batch at current step.
 
         for i in range(steps):
             mask_index = (x == self.mask_token_id)
