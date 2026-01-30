@@ -1,0 +1,6 @@
+name: "random_probe"
+alpha: 5.0
+quality_scale: 1.0
+pool: "max"
+target: "logits"
+top_k: 0

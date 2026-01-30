@@ -1,4 +1,8 @@
 import json
+import multiprocessing
+
+import torch
+from sentence_transformers import util
 
 
 def save_html_dashboard(history, filename="llada_dpp_viz.html"):
@@ -121,7 +125,7 @@ def save_html_dashboard(history, filename="llada_dpp_viz.html"):
 
             document.getElementById('stepDisplay').innerText = `Step ${{stepIdx}} / ${{data.length-1}}`;
             document.getElementById('alphaDisplay').innerText = stepData.alpha.toFixed(2);
-            document.getElementById('gateDisplay').innerText = stepData.gate.toFixed(2);
+            document.getElementById('gateDisplay').innerText = (stepData.gate || 0).toFixed(2);
             document.getElementById('stepSlider').value = stepIdx;
 
             const grid = document.getElementById('grid');
@@ -178,3 +182,74 @@ def save_html_dashboard(history, filename="llada_dpp_viz.html"):
     with open(filename, "w", encoding="utf-8") as f:
         f.write(html_content)
     print(f"\nSaved interactive visualization to: {filename}")
+
+
+def calculate_diversity_score(eval_model, texts):
+    if len(texts) < 2: return 0.0
+    embeddings = eval_model.encode(texts, convert_to_tensor=True)
+    cos_scores = util.cos_sim(embeddings, embeddings)
+    mask = torch.eye(len(texts), dtype=torch.bool).to(cos_scores.device)
+    cos_scores.masked_fill_(mask, 0.0)
+    avg_sim = cos_scores.sum() / (len(texts) * (len(texts) - 1))
+    return 1.0 - avg_sim.item()
+
+
+def run_test(code, result_queue):
+    try:
+        # Standard imports for HumanEval
+        import math, re, collections, heapq, itertools, functools, bisect, random, statistics
+        from typing import List, Tuple, Optional, Dict, Any, Union
+
+        # Prepare global namespace
+        local_scope = locals()
+        exec(code, local_scope)
+        result_queue.put("passed")
+    except Exception as e:
+        result_queue.put(f"failed: {{e}}")
+
+
+def check_correctness(sample, test_code, timeout=5.0):
+    full_code = "import math\nimport re\nimport collections\nimport heapq\nimport itertools\nimport functools\nfrom typing import *\n" + sample + "\n" + test_code
+
+    q = multiprocessing.Queue()
+    p = multiprocessing.Process(target=run_test, args=(full_code, q))
+    p.start()
+    p.join(timeout)
+
+    if p.is_alive():
+        p.terminate()
+        p.join()  # Ensure it's dead
+        return False
+
+    if not q.empty():
+        res = q.get()
+        return res == "passed"
+    return False
+
+
+def calculate_pass_at_k(n, c, k):
+    """
+    n: total samples
+    c: correct samples
+    k: k for pass@k
+    Formula: 1 - comb(n-c, k) / comb(n, k)
+    """
+    if n - c < k: return 1.0
+    if n < k: return 0.0  # Should not happen if k <= n
+
+    import math
+
+    # Calculate using logs to avoid overflow/underflow for large numbers
+    # log(comb(N, K)) = lgamma(N+1) - lgamma(K+1) - lgamma(N-K+1)
+
+    def lcomb(N, K):
+        if K < 0 or K > N: return float('-inf')
+        return math.lgamma(N + 1) - math.lgamma(K + 1) - math.lgamma(N - K + 1)
+
+    log_num = lcomb(n - c, k)
+    log_den = lcomb(n, k)
+
+    prob_all_wrong = math.exp(log_num - log_den)
+    return 1.0 - prob_all_wrong
+
+

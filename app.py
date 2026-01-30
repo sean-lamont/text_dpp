@@ -165,6 +165,11 @@ def generate_viz_html(history):
                     el.classList.add('flip');
                 }}
 
+                // New/Unmasked detection
+                if (batch.is_unmasked_next && batch.is_unmasked_next[tIdx]) {{
+                    el.classList.add('new');
+                }}
+
                 el.onmouseenter = () => updateInspector(step, bIdx, tIdx);
                 stream.appendChild(el);
             }});
@@ -246,22 +251,27 @@ if __name__ == '__main__':
 
     with st.sidebar:
         st.header("1. Parameters")
-        prompt_input = st.text_area("Prompt", "Write a short poem about rust and code.", height=80)
+        prompt_input = st.text_area("Prompt", "Write python code to compute the factorial of n", height=80)
 
         c1, c2 = st.columns(2)
         with c1:
             batch_size = st.number_input("Batch Size", 1, 64, 4)
             gen_len = st.number_input("Gen Length", 16, 128, 64)
+
+        alpha = st.number_input("Alpha (Diversity Step Size)", 0.0, 100.0, 1.0)
+
         with c2:
             steps = st.number_input("Steps", 10, 100, 32)
-            temp = st.number_input("Temperature", 0.0, 2.0, 1.0)
+            temp = st.number_input("Temperature", 0.0, 5.0, 1.0)
+
+        quality_scale = st.number_input("Quality scale", 0.0, 100.0, 1.0)
 
         st.divider()
         st.subheader("DPP Controls")
-        strategy_name = st.selectbox("Strategy", ["sequential_subtraction", "gram_schmidt", "orthogonal_projection", "joint"])
-        alpha = st.slider("Alpha (Repulsion)", 0.0, 100.0, 5.0)
-        quality_scale = st.slider("Quality Scale", 0.0, 10.0, 1.0)
-        
+        strategy_name = st.selectbox("Strategy", ["sequential_subtraction", "gram_schmidt", "orthogonal_projection", "joint", "random_probe"])
+        # quality_scale = st.slider("Quality Scale", 0.0, 10.0, 1.0)
+        # alpha = st.slider("Alpha (Repulsion)", 0.0, 100.0, 5.0)
+
         target = st.selectbox("Kernel Target", ["logits", "embeddings"])
         pool = st.selectbox("Pooling", ["max", "mean", "positional"])
 

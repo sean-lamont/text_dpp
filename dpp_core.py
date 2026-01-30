@@ -1,10 +1,13 @@
+from abc import ABC, abstractmethod
+from typing import List, Dict, Optional, Tuple
+
 import numpy as np
 import torch
 import torch.nn.functional as F
-from sentence_transformers import util
-from abc import ABC, abstractmethod
 import wandb
-from typing import List, Dict, Optional, Tuple, Union
+
+
+# function to print time
 
 class FeatureExtractor:
     def __init__(self, embedding_matrix: Optional[torch.Tensor] = None,
@@ -18,7 +21,8 @@ class FeatureExtractor:
         self.top_k = top_k
         self.seq_len_scale = seq_len_scale
 
-    def extract(self, logit_k: torch.Tensor, mask_k: torch.Tensor, x_k: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def extract(self, logit_k: torch.Tensor, mask_k: torch.Tensor, x_k: torch.Tensor) -> Tuple[
+        torch.Tensor, torch.Tensor]:
         """
         Extracts the feature vector and quality score for a single batch item or the whole batch.
         """
@@ -79,6 +83,7 @@ class FeatureExtractor:
 
         return norm_vec, quality
 
+
 class DPPStrategy(ABC):
     def __init__(self, alpha: float, quality_scale: float, feature_extractor: FeatureExtractor):
         self.alpha = alpha
@@ -104,6 +109,7 @@ class DPPStrategy(ABC):
 
         grad_safe = torch.where(max_norms > 0, grad / max_norms, grad)
         return grad_safe
+
 
 class SequentialSubtractionStrategy(DPPStrategy):
     def apply(self, logits: torch.Tensor, mask_index: torch.Tensor, x: torch.Tensor,
@@ -164,6 +170,7 @@ class SequentialSubtractionStrategy(DPPStrategy):
 
         return logits - update, metadata
 
+
 class GramSchmidtStrategy(DPPStrategy):
     def apply(self, logits: torch.Tensor, mask_index: torch.Tensor, x: torch.Tensor,
               history_vecs: List[torch.Tensor], history_qualities: List[float],
@@ -205,6 +212,68 @@ class GramSchmidtStrategy(DPPStrategy):
         update = self.alpha * final_grads
         metadata["force_map"] = torch.norm(update, p=2, dim=-1).detach().float().cpu()
         return logits - update, metadata
+
+
+class RandomProbeStrategy(DPPStrategy):
+    def apply(self, logits: torch.Tensor, mask_index: torch.Tensor, x: torch.Tensor,
+              history_vecs: List[torch.Tensor], history_qualities: List[float],
+              protected_tokens: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Dict]:
+
+        metadata = {"entropy_map": [], "force_map": []}
+        current_logits = logits.clone().detach()
+        final_grads = torch.zeros_like(logits)
+
+        local_history_vecs = list(history_vecs)
+
+        for k in range(logits.shape[0]):
+            logit_k = logits[k].unsqueeze(0).detach().clone().requires_grad_(True)
+            norm_vec_k, qual_k = self.feature_extractor.extract(
+                logit_k, mask_index[k].unsqueeze(0), x[k].unsqueeze(0)
+            )
+
+            if k > 0 or local_history_vecs:
+
+                ortho_basis = []
+                for q in local_history_vecs:
+                    u = q.clone()
+                    for b in ortho_basis:
+                        u = u - torch.dot(u.view(-1), b.view(-1)) * b
+
+                    u_norm = torch.norm(u)
+                    if u_norm > 1e-6:
+                        ortho_basis.append(u / u_norm)
+
+                probe = torch.randn_like(norm_vec_k).detach()
+
+                for b in ortho_basis:
+                    proj = torch.dot(probe.view(-1), b.view(-1)) * b
+                    probe = probe - proj
+
+                probe_norm = torch.norm(probe)
+                if probe_norm > 1e-6:
+                    target_dir = probe / probe_norm
+                    alignment = torch.dot(norm_vec_k.view(-1), target_dir.view(-1))
+                    loss = -alignment * (self.quality_scale * qual_k)
+
+                    if loss.requires_grad:
+                        raw_grads = torch.autograd.grad(loss, logit_k)[0]
+                        final_grads[k] = self._normalize_gradient(raw_grads, protected_tokens).squeeze(0)
+
+            if k > 0 or local_history_vecs:
+                current_logits[k] -= (self.alpha * final_grads[k])
+
+            with torch.no_grad():
+                norm_vec_new, _ = self.feature_extractor.extract(
+                    current_logits[k].unsqueeze(0),
+                    mask_index[k].unsqueeze(0),
+                    x[k].unsqueeze(0)
+                )
+                local_history_vecs.append(norm_vec_new)
+
+        update = self.alpha * final_grads
+        metadata["force_map"] = torch.norm(update, p=2, dim=-1).detach().float().cpu()
+        return logits - update, metadata
+
 
 class OrthogonalProjectionStrategy(DPPStrategy):
     def apply(self, logits: torch.Tensor, mask_index: torch.Tensor, x: torch.Tensor,
@@ -264,11 +333,11 @@ class OrthogonalProjectionStrategy(DPPStrategy):
         metadata["force_map"] = torch.norm(update, p=2, dim=-1).detach().float().cpu()
         return logits - update, metadata
 
+
 class JointStrategy(DPPStrategy):
     def apply(self, logits: torch.Tensor, mask_index: torch.Tensor, x: torch.Tensor,
               history_vecs: List[torch.Tensor], history_qualities: List[float],
               protected_tokens: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Dict]:
-
         metadata = {"entropy_map": [], "force_map": []}
 
         logits_in = logits.detach().clone().requires_grad_(True)
@@ -288,6 +357,7 @@ class JointStrategy(DPPStrategy):
         metadata["force_map"] = torch.norm(update, p=2, dim=-1).detach().float().cpu()
 
         return logits - update, metadata
+
 
 class DPPGenerator:
     def __init__(self, model, tokenizer, strategy: DPPStrategy, mask_token_id: int):
@@ -337,7 +407,8 @@ class DPPGenerator:
         x[:, :prompt_len] = prompt_ids.clone()
 
         attention_mask = torch.cat(
-            [attention_mask, torch.ones((batch_size, gen_length), dtype=attention_mask.dtype, device=self.device)], dim=-1)
+            [attention_mask, torch.ones((batch_size, gen_length), dtype=attention_mask.dtype, device=self.device)],
+            dim=-1)
 
         mask_index_init = (x[:, prompt_len:] == self.mask_token_id)
         num_transfer_tokens_schedule = self.get_num_transfer_tokens(mask_index_init, steps)
@@ -366,7 +437,7 @@ class DPPGenerator:
             with torch.no_grad():
                 probs_original = torch.softmax(gen_logits, dim=-1)
                 top1_original = torch.argmax(probs_original, dim=-1)
-                
+
                 # Get Top K of Original Distribution
                 k_val = 5
                 topk_probs_orig, topk_indices_orig = torch.topk(probs_original, k=k_val, dim=-1)
@@ -377,7 +448,7 @@ class DPPGenerator:
                     gen_logits,
                     mask_index=mask_index[:, prompt_len:],
                     x=x[:, prompt_len:],
-                    history_vecs=[], # Reset history for each step as per original implementation
+                    history_vecs=[],  # Reset history for each step as per original implementation
                     history_qualities=[],
                     protected_tokens=protected_tokens
                 )
@@ -389,20 +460,20 @@ class DPPGenerator:
                 if "force_map" in meta:
                     metadata["force_map"] = meta["force_map"]
 
-            self.strategy.alpha = original_alpha # Restore
+            self.strategy.alpha = original_alpha  # Restore
 
             # 2. Capture Final State (After DPP)
             with torch.no_grad():
                 gen_logits_final = logits[:, prompt_len:, :]
                 probs_final = torch.softmax(gen_logits_final, dim=-1)
                 top1_final = torch.argmax(probs_final, dim=-1)
-                
+
                 # Identify Flips
                 flips = (top1_original != top1_final)
-                
+
                 # Get Top K of Final Distribution
                 topk_probs_final, topk_indices_final = torch.topk(probs_final, k=k_val, dim=-1)
-                
+
                 # Get Original Probabilities at Final Indices (Current Top K)
                 topk_probs_original_at_final = torch.gather(probs_original, -1, topk_indices_final)
 
@@ -437,7 +508,7 @@ class DPPGenerator:
                 raw_ids = x[b, prompt_len:].tolist()
                 display_tokens = []
                 special_mask = []
-                
+
                 # Get transfer mask for this batch's generated part
                 batch_transfer_mask = transfer_index[b, prompt_len:].cpu().tolist()
 
@@ -445,11 +516,11 @@ class DPPGenerator:
                 batch_topk_indices_final = topk_indices_final[b].cpu().numpy()
                 batch_topk_probs_final = topk_probs_final[b].cpu().numpy()
                 batch_topk_probs_orig_at_final = topk_probs_original_at_final[b].cpu().numpy()
-                
+
                 batch_topk_indices_orig = topk_indices_orig[b].cpu().numpy()
                 batch_topk_probs_orig = topk_probs_orig[b].cpu().numpy()
                 batch_topk_probs_final_at_orig = topk_probs_final_at_orig[b].cpu().numpy()
-                
+
                 batch_flips = flips[b].cpu().tolist()
 
                 # Lists for JSON
@@ -465,8 +536,8 @@ class DPPGenerator:
                     # Final Top K Processing
                     decoded_final = []
                     for tk_id in batch_topk_indices_final[t_idx_seq]:
-                         tk_str = self.tokenizer.decode([tk_id]).replace("Ġ", " ").replace("\n", "⏎")
-                         decoded_final.append(tk_str)
+                        tk_str = self.tokenizer.decode([tk_id]).replace("Ġ", " ").replace("\n", "⏎")
+                        decoded_final.append(tk_str)
                     top_k_final_token_list.append(decoded_final)
                     top_k_final_prob_list.append(batch_topk_probs_final[t_idx_seq].tolist())
                     top_k_final_prob_orig_list.append(batch_topk_probs_orig_at_final[t_idx_seq].tolist())
@@ -474,8 +545,8 @@ class DPPGenerator:
                     # Original Top K Processing
                     decoded_orig = []
                     for tk_id in batch_topk_indices_orig[t_idx_seq]:
-                         tk_str = self.tokenizer.decode([tk_id]).replace("Ġ", " ").replace("\n", "⏎")
-                         decoded_orig.append(tk_str)
+                        tk_str = self.tokenizer.decode([tk_id]).replace("Ġ", " ").replace("\n", "⏎")
+                        decoded_orig.append(tk_str)
                     top_k_orig_token_list.append(decoded_orig)
                     top_k_orig_prob_list.append(batch_topk_probs_orig[t_idx_seq].tolist())
                     top_k_orig_prob_final_list.append(batch_topk_probs_final_at_orig[t_idx_seq].tolist())
@@ -506,7 +577,7 @@ class DPPGenerator:
                     "top_k_orig_tokens": top_k_orig_token_list,
                     "top_k_orig_probs": top_k_orig_prob_list,
                     "top_k_orig_probs_final": top_k_orig_prob_final_list,
-                    
+
                     "entropy": metadata["entropy_map"][b].tolist() if len(metadata["entropy_map"]) > 0 else [],
                     "force": metadata["force_map"][b].tolist() if len(metadata["force_map"]) > 0 else []
                 })
@@ -515,22 +586,6 @@ class DPPGenerator:
             if use_wandb:
                 wandb.log({"step": i, "alpha": curr_alpha})
 
-            # Sampling
-            logits_with_noise = self.add_gumbel_noise(logits, temperature=temperature)
-            x0 = torch.argmax(logits_with_noise, dim=-1)
-
-            p = F.softmax(logits, dim=-1)
-            x0_p = torch.squeeze(torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1)
-
-            x0 = torch.where(mask_index, x0, x)
-            confidence = torch.where(mask_index, x0_p, torch.tensor(-np.inf).to(x0_p.device))
-
-            transfer_index = torch.zeros_like(x0, dtype=torch.bool, device=x0.device)
-            for j in range(batch_size):
-                k = num_transfer_tokens_schedule[j, i]
-                if k > 0:
-                    _, select_index = torch.topk(confidence[j], k=k)
-                    transfer_index[j, select_index] = True
             x[transfer_index] = x0[transfer_index]
 
         final_frame = {"step": steps, "alpha": 0.0, "batches": []}
@@ -556,6 +611,7 @@ class DPPGenerator:
 
         return history_frames, samples
 
+
 def get_strategy(name: str, alpha: float, quality_scale: float, feature_extractor: FeatureExtractor) -> DPPStrategy:
     if name == "sequential_subtraction":
         return SequentialSubtractionStrategy(alpha, quality_scale, feature_extractor)
@@ -563,7 +619,10 @@ def get_strategy(name: str, alpha: float, quality_scale: float, feature_extracto
         return GramSchmidtStrategy(alpha, quality_scale, feature_extractor)
     elif name == "orthogonal_projection":
         return OrthogonalProjectionStrategy(alpha, quality_scale, feature_extractor)
+    elif name == "random_probe":  # <--- NEW
+        return RandomProbeStrategy(alpha, quality_scale, feature_extractor)
     elif name == "joint":
         return JointStrategy(alpha, quality_scale, feature_extractor)
     else:
         raise ValueError(f"Unknown strategy: {name}")
+

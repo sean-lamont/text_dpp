@@ -1,12 +1,13 @@
 defaults:
   - model: llada
-  - strategy: joint
+  - strategy: random_probe
   - _self_
 
 prompt: "Write a python function to compute fibonacci."
 batch_size: 4
+n_problems: -1
 steps: 32
-gen_length: 64
+gen_length: 32
 temperature: 1.0
 seed: 42
 use_wandb: false
