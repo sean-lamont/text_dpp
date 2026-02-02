@@ -54,7 +54,7 @@ def objective(trial):
     temperature = trial.suggest_float("temperature", 0.0, 1.5)
 
     # Sweep Constants
-    batch_size = 4
+    batch_size = 8
     n_problems = 164 # HumanEval has 164 problems
     steps = 32
 
