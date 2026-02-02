@@ -50,7 +50,7 @@ def objective(trial):
     # 1. Define Search Space
     strategy_name = trial.suggest_categorical("strategy.name", [
         "random_probe", "gram_schmidt", "orthogonal_projection",
-        "joint", "sequential_subtraction"
+        "joint", #"sequential_subtraction"
     ])
 
     # Conditional Hyperparameters
@@ -198,7 +198,7 @@ if __name__ == "__main__":
     storage_url = "postgresql://optuna_user:secure_password@127.0.0.1:5432/optuna"
 
     study = optuna.create_study(
-        study_name="gsm8k",
+        study_name="gsm8k_sweep",
         storage=storage_url,  # <--- Updated
         load_if_exists=True,
         direction="maximize",
