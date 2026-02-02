@@ -62,7 +62,7 @@ def objective(trial):
     temperature = trial.suggest_float("temperature", 0.0, 1.5)
 
     # Sweep Constants
-    batch_size = 8
+    batch_size = 6
     n_problems = 300
     steps = 32
 
