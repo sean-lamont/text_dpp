@@ -202,7 +202,7 @@ if __name__ == "__main__":
         storage=storage_url,  # <--- Updated
         load_if_exists=True,
         direction="maximize",
-        sampler=optuna.samplers.TPESampler(seed=42)
+        sampler=optuna.samplers.TPESampler()
     )
 
 
