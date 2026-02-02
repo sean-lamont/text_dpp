@@ -1,38 +1,30 @@
+import sys
+import os
 import time
 import hydra
 import optuna
 import wandb
 import numpy as np
-from omegaconf import OmegaConf
+from omegaconf import OmegaConf, DictConfig
+import re
 
-# Import your existing project modules
+# Add human-eval to path to allow imports
+sys.path.append(os.path.join(os.getcwd(), "human-eval"))
+from human_eval.data import read_problems
+from human_eval.execution import check_correctness
+
+# Import existing project modules
 from dpp_core import FeatureExtractor, get_strategy, DPPGenerator
 from dpp_gen import load_model
-from utils import calculate_diversity_score, calculate_pass_at_k
-import re
-from datasets import load_dataset
+from utils import calculate_diversity_score
 from sentence_transformers import SentenceTransformer
 
-
-def extract_answer_num(text):
-    try:
-        text = text.replace(',', '')
-        nums = re.findall(r"[-+]?\d*\.\d+|\d+", text)
-        if nums: return float(nums[-1])
-    except Exception as e:
-        print(e)
-    return None
-
-
-def extract_gold_num(answer_str):
-    if "####" in answer_str:
-        try:
-            val = answer_str.split("####")[1].strip()
-            return float(val.replace(',', ''))
-        except:
-            pass
-    return None
-
+def clean_code_for_harness(prompt, completion):
+    if "```python" in completion:
+        completion = completion.split("```python")[1].split("```")[0]
+    elif "```" in completion:
+        completion = completion.split("```")[1].split("```")[0]
+    return completion
 
 print(">>> Initializing Global Resources for Sweep...")
 with hydra.initialize(version_base=None, config_path="conf"):
@@ -40,8 +32,8 @@ with hydra.initialize(version_base=None, config_path="conf"):
 
 model, tokenizer, embedding_matrix, mask_token_id = load_model(base_cfg)
 eval_model = SentenceTransformer('all-MiniLM-L6-v2')
-dataset = load_dataset("gsm8k", "main", split="test")
-
+problems_dict = read_problems()
+problem_list = list(problems_dict.values())
 
 # -------------------------------------------------------------------
 # OPTUNA OBJECTIVE
@@ -63,7 +55,7 @@ def objective(trial):
 
     # Sweep Constants
     batch_size = 8
-    n_problems = 300
+    n_problems = 164 # HumanEval has 164 problems
     steps = 32
 
     # 2. Merge Config
@@ -81,7 +73,7 @@ def objective(trial):
     # 3. Init W&B Run
     run_name = f"trial_{trial.number}_{strategy_name}"
     run = wandb.init(
-        project="gsm8k_sweep",
+        project="humaneval_sweep",
         group="tpe_l64",
         name=run_name,
         config=OmegaConf.to_container(cfg, resolve=True),
@@ -89,7 +81,7 @@ def objective(trial):
     )
 
     # 4. Init Results Table
-    results_table = wandb.Table(columns=["question", "gold", "generated", "is_correct", "diversity"])
+    results_table = wandb.Table(columns=["task_id", "prompt", "completion", "result", "passed", "diversity"])
 
     try:
         print(f"\n>>> STARTING TRIAL {trial.number}: {strategy_name} (alpha={strategy_alpha:.2f})")
@@ -99,7 +91,6 @@ def objective(trial):
             embedding_matrix=embedding_matrix,
             kernel_target=cfg.strategy.target,
             pooling_method=cfg.strategy.pool,
-            top_k=cfg.strategy.get("top_k", 0)
         )
 
         dpp_strategy = get_strategy(
@@ -114,40 +105,37 @@ def objective(trial):
         pass_k_list = []
         diversity_scores = []
 
-        # Limit problems if needed
-        problem_indices = range(min(n_problems, len(dataset)))
+        # Limit problems if needed (e.g. debugging)
+        current_problems = problem_list[:n_problems]
 
-        for i in problem_indices:
-            row = dataset[i]
-            q = row['question']
-            gold = extract_gold_num(row['answer'])
-            if gold is None: continue
+        for i, problem in enumerate(current_problems):
+            task_id = problem['task_id']
+            prompt = problem['prompt']
 
-            # --- RESTORED PRINT: Problem Header ---
-            print(f"\n--- Problem {i + 1} (Gold: {gold}) ---")
-
-            formatted_prompt = f"Question: {q}\nLet's think step by step.\nAnswer:"
+            print(f"\n--- Problem {i + 1}/{len(current_problems)}: {task_id} ---")
 
             start_t = time.time()
 
             # Generate
             _, samples = generator.generate(
-                prompt=formatted_prompt,
+                prompt=prompt,
                 batch_size=cfg.batch_size,
                 steps=cfg.steps,
-                gen_length=cfg.get("gen_length", 128),
+                gen_length=cfg.get("gen_length", 256),
                 temperature=cfg.temperature,
             )
 
             # Evaluate
             correct_count = 0
+            batch_results = []
             for s in samples:
-                val = extract_answer_num(s)
-                if val is not None and abs(val - gold) < 1e-4:
+                cleaned_code = clean_code_for_harness(prompt, s)
+                res = check_correctness(problem, cleaned_code, timeout=3.0)
+                batch_results.append((s, cleaned_code, res))
+                if res['passed']:
                     correct_count += 1
 
             pk = 1 if correct_count > 0 else 0
-            # pk = calculate_pass_at_k(len(samples), correct_count, cfg.batch_size)
             div = calculate_diversity_score(eval_model, samples)
 
             pass_k_list.append(pk)
@@ -157,10 +145,8 @@ def objective(trial):
                 f"Correct: {correct_count}/{len(samples)} | Pass@{cfg.batch_size}: {pk:.2f} | Div: {div:.3f} | Time: {time.time() - start_t:.1f}s")
 
             # W&B Logging
-            is_correct_batch = (correct_count > 0)
-            results_table.add_data(q, gold, samples[0], is_correct_batch, div)
-            for sample in samples[1:]:
-                results_table.add_data('', gold, sample, is_correct_batch, div)
+            for s, cleaned_s, res in batch_results:
+                 results_table.add_data(task_id, prompt, cleaned_s, res['result'], res['passed'], div)
 
             wandb.log({
                 "problem_idx": i,
@@ -175,13 +161,11 @@ def objective(trial):
         avg_pass_k = np.mean(pass_k_list) if pass_k_list else 0.0
         avg_div = np.mean(diversity_scores) if diversity_scores else 0.0
 
-        # --- RESTORED PRINT: Final Results Block ---
         print("\n" + "=" * 60)
         print(
             f"RESULTS (Trial {trial.number}): Pass@{cfg.batch_size}: {avg_pass_k * 100:.1f}% | Avg Diversity: {avg_div:.3f}")
         print("=" * 60)
 
-        # Log final table and metrics
         wandb.log({
             "pass_k": avg_pass_k,
             "avg_diversity": avg_div,
@@ -201,7 +185,7 @@ if __name__ == "__main__":
     )
 
     print(">>> STARTING OPTUNA SWEEP")
-    study.optimize(objective) #, n_trials=50)
+    study.optimize(objective)
 
     print(">>> SWEEP COMPLETE")
     print("Best params:", study.best_params)

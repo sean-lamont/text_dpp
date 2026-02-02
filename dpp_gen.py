@@ -40,8 +40,6 @@ def load_model(cfg):
 
 @hydra.main(version_base=None, config_path="conf", config_name="config")
 def main(cfg: DictConfig):
-    if cfg.use_wandb:
-        wandb.init(project=cfg.wandb_project, entity=cfg.wandb_entity, config=dict(cfg))
 
     model, tokenizer, embedding_matrix, mask_token_id = load_model(cfg)
 
@@ -68,7 +66,6 @@ def main(cfg: DictConfig):
         steps=cfg.steps, 
         gen_length=cfg.gen_length, 
         temperature=cfg.temperature,
-        use_wandb=cfg.use_wandb
     )
 
     for i, s in enumerate(samples):

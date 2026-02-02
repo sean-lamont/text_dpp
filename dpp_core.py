@@ -1,10 +1,8 @@
-from abc import ABC, abstractmethod
-from typing import List, Dict, Optional, Tuple
-
 import numpy as np
 import torch
 import torch.nn.functional as F
-import wandb
+from abc import ABC, abstractmethod
+from typing import List, Dict, Optional, Tuple
 
 
 # function to print time
@@ -393,7 +391,7 @@ class DPPGenerator:
         return num_transfer_tokens
 
     def generate(self, prompt: str, batch_size: int, steps: int, gen_length: int, temperature: float,
-                 use_wandb: bool = False) -> Tuple[List[Dict], List[str]]:
+                 ) -> Tuple[List[Dict], List[str]]:
 
         messages = [{"role": "user", "content": prompt}]
         prompt_str = self.tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
@@ -582,9 +580,6 @@ class DPPGenerator:
                     "force": metadata["force_map"][b].tolist() if len(metadata["force_map"]) > 0 else []
                 })
             history_frames.append(frame_data)
-
-            if use_wandb:
-                wandb.log({"step": i, "alpha": curr_alpha})
 
             x[transfer_index] = x0[transfer_index]
 
