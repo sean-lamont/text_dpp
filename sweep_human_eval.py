@@ -54,7 +54,7 @@ def objective(trial):
     temperature = trial.suggest_float("temperature", 0.0, 1.5)
 
     # Sweep Constants
-    batch_size = 8
+    batch_size = 4
     n_problems = 164 # HumanEval has 164 problems
     steps = 32
 
@@ -179,7 +179,12 @@ def objective(trial):
 
 
 if __name__ == "__main__":
+    storage_url = "postgresql://optuna_user:secure_password@127.0.0.1:5432/optuna"
+
     study = optuna.create_study(
+        study_name="human_eval",
+        storage=storage_url,  # <--- Updated
+        load_if_exists=True,
         direction="maximize",
         sampler=optuna.samplers.TPESampler(seed=42)
     )
