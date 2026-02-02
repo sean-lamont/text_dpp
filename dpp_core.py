@@ -416,8 +416,10 @@ class DPPGenerator:
 
         for i in range(steps):
             mask_index = (x == self.mask_token_id)
-            logits = self.model(x, attention_mask=attention_mask).logits
-            gen_logits = logits[:, prompt_len:, :].clone()
+
+            with torch.no_grad():
+                logits = self.model(x, attention_mask=attention_mask).logits
+                gen_logits = logits[:, prompt_len:, :].clone()
 
             # Decay alpha
             curr_alpha = self.strategy.alpha * (1 - (i / steps))
@@ -478,110 +480,110 @@ class DPPGenerator:
                 # Get Final Probabilities at Original Indices (Original Top K)
                 topk_probs_final_at_orig = torch.gather(probs_final, -1, topk_indices_orig)
 
-            # 3. Sampling Logic (Calculate transfer_index but don't apply yet)
-            logits_with_noise = self.add_gumbel_noise(logits, temperature=temperature)
-            x0 = torch.argmax(logits_with_noise, dim=-1)
+                # 3. Sampling Logic (Calculate transfer_index but don't apply yet)
+                logits_with_noise = self.add_gumbel_noise(logits, temperature=temperature)
+                x0 = torch.argmax(logits_with_noise, dim=-1)
 
-            p = F.softmax(logits, dim=-1)
-            x0_p = torch.squeeze(torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1)
+                p = F.softmax(logits, dim=-1)
+                x0_p = torch.squeeze(torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1)
 
-            x0 = torch.where(mask_index, x0, x)
-            confidence = torch.where(mask_index, x0_p, torch.tensor(-np.inf).to(x0_p.device))
+                x0 = torch.where(mask_index, x0, x)
+                confidence = torch.where(mask_index, x0_p, torch.tensor(-np.inf).to(x0_p.device))
 
-            transfer_index = torch.zeros_like(x0, dtype=torch.bool, device=x0.device)
-            for j in range(batch_size):
-                k = num_transfer_tokens_schedule[j, i]
-                if k > 0:
-                    _, select_index = torch.topk(confidence[j], k=k)
-                    transfer_index[j, select_index] = True
+                transfer_index = torch.zeros_like(x0, dtype=torch.bool, device=x0.device)
+                for j in range(batch_size):
+                    k = num_transfer_tokens_schedule[j, i]
+                    if k > 0:
+                        _, select_index = torch.topk(confidence[j], k=k)
+                        transfer_index[j, select_index] = True
 
-            # Logging / Frame Capture
-            frame_data = {
-                "step": i,
-                "alpha": float(curr_alpha),
-                "batches": []
-            }
+                # Logging / Frame Capture
+                frame_data = {
+                    "step": i,
+                    "alpha": float(curr_alpha),
+                    "batches": []
+                }
 
-            for b in range(batch_size):
-                raw_ids = x[b, prompt_len:].tolist()
-                display_tokens = []
-                special_mask = []
+                for b in range(batch_size):
+                    raw_ids = x[b, prompt_len:].tolist()
+                    display_tokens = []
+                    special_mask = []
 
-                # Get transfer mask for this batch's generated part
-                batch_transfer_mask = transfer_index[b, prompt_len:].cpu().tolist()
+                    # Get transfer mask for this batch's generated part
+                    batch_transfer_mask = transfer_index[b, prompt_len:].cpu().tolist()
 
-                # Extract Data for this batch
-                batch_topk_indices_final = topk_indices_final[b].cpu().numpy()
-                batch_topk_probs_final = topk_probs_final[b].cpu().numpy()
-                batch_topk_probs_orig_at_final = topk_probs_original_at_final[b].cpu().numpy()
+                    # Extract Data for this batch
+                    batch_topk_indices_final = topk_indices_final[b].cpu().numpy()
+                    batch_topk_probs_final = topk_probs_final[b].cpu().numpy()
+                    batch_topk_probs_orig_at_final = topk_probs_original_at_final[b].cpu().numpy()
 
-                batch_topk_indices_orig = topk_indices_orig[b].cpu().numpy()
-                batch_topk_probs_orig = topk_probs_orig[b].cpu().numpy()
-                batch_topk_probs_final_at_orig = topk_probs_final_at_orig[b].cpu().numpy()
+                    batch_topk_indices_orig = topk_indices_orig[b].cpu().numpy()
+                    batch_topk_probs_orig = topk_probs_orig[b].cpu().numpy()
+                    batch_topk_probs_final_at_orig = topk_probs_final_at_orig[b].cpu().numpy()
 
-                batch_flips = flips[b].cpu().tolist()
+                    batch_flips = flips[b].cpu().tolist()
 
-                # Lists for JSON
-                top_k_final_token_list = []
-                top_k_final_prob_list = []
-                top_k_final_prob_orig_list = []
+                    # Lists for JSON
+                    top_k_final_token_list = []
+                    top_k_final_prob_list = []
+                    top_k_final_prob_orig_list = []
 
-                top_k_orig_token_list = []
-                top_k_orig_prob_list = []
-                top_k_orig_prob_final_list = []
+                    top_k_orig_token_list = []
+                    top_k_orig_prob_list = []
+                    top_k_orig_prob_final_list = []
 
-                for t_idx_seq in range(len(raw_ids)):
-                    # Final Top K Processing
-                    decoded_final = []
-                    for tk_id in batch_topk_indices_final[t_idx_seq]:
-                        tk_str = self.tokenizer.decode([tk_id]).replace("Ġ", " ").replace("\n", "⏎")
-                        decoded_final.append(tk_str)
-                    top_k_final_token_list.append(decoded_final)
-                    top_k_final_prob_list.append(batch_topk_probs_final[t_idx_seq].tolist())
-                    top_k_final_prob_orig_list.append(batch_topk_probs_orig_at_final[t_idx_seq].tolist())
+                    for t_idx_seq in range(len(raw_ids)):
+                        # Final Top K Processing
+                        decoded_final = []
+                        for tk_id in batch_topk_indices_final[t_idx_seq]:
+                            tk_str = self.tokenizer.decode([tk_id]).replace("Ġ", " ").replace("\n", "⏎")
+                            decoded_final.append(tk_str)
+                        top_k_final_token_list.append(decoded_final)
+                        top_k_final_prob_list.append(batch_topk_probs_final[t_idx_seq].tolist())
+                        top_k_final_prob_orig_list.append(batch_topk_probs_orig_at_final[t_idx_seq].tolist())
 
-                    # Original Top K Processing
-                    decoded_orig = []
-                    for tk_id in batch_topk_indices_orig[t_idx_seq]:
-                        tk_str = self.tokenizer.decode([tk_id]).replace("Ġ", " ").replace("\n", "⏎")
-                        decoded_orig.append(tk_str)
-                    top_k_orig_token_list.append(decoded_orig)
-                    top_k_orig_prob_list.append(batch_topk_probs_orig[t_idx_seq].tolist())
-                    top_k_orig_prob_final_list.append(batch_topk_probs_final_at_orig[t_idx_seq].tolist())
+                        # Original Top K Processing
+                        decoded_orig = []
+                        for tk_id in batch_topk_indices_orig[t_idx_seq]:
+                            tk_str = self.tokenizer.decode([tk_id]).replace("Ġ", " ").replace("\n", "⏎")
+                            decoded_orig.append(tk_str)
+                        top_k_orig_token_list.append(decoded_orig)
+                        top_k_orig_prob_list.append(batch_topk_probs_orig[t_idx_seq].tolist())
+                        top_k_orig_prob_final_list.append(batch_topk_probs_final_at_orig[t_idx_seq].tolist())
 
-                for tid in raw_ids:
-                    if tid == self.mask_token_id:
-                        display_tokens.append("[MASK]")
-                        special_mask.append(False)
-                    else:
-                        t_str = self.tokenizer.decode([tid]).replace("Ġ", " ").replace("\n", "⏎")
-                        if self.tokenizer.mask_token and self.tokenizer.mask_token in t_str:
-                            t_str = t_str.replace(self.tokenizer.mask_token, "[MASK]")
-                        display_tokens.append(t_str)
-                        is_special = (tid == self.tokenizer.eos_token_id or tid == self.tokenizer.pad_token_id)
-                        special_mask.append(is_special)
+                    for tid in raw_ids:
+                        if tid == self.mask_token_id:
+                            display_tokens.append("[MASK]")
+                            special_mask.append(False)
+                        else:
+                            t_str = self.tokenizer.decode([tid]).replace("Ġ", " ").replace("\n", "⏎")
+                            if self.tokenizer.mask_token and self.tokenizer.mask_token in t_str:
+                                t_str = t_str.replace(self.tokenizer.mask_token, "[MASK]")
+                            display_tokens.append(t_str)
+                            is_special = (tid == self.tokenizer.eos_token_id or tid == self.tokenizer.pad_token_id)
+                            special_mask.append(is_special)
 
-                frame_data["batches"].append({
-                    "tokens": display_tokens,
-                    "is_mask": [tid == self.mask_token_id for tid in raw_ids],
-                    "is_special": special_mask,
-                    "is_flip": batch_flips,
-                    "is_unmasked_next": batch_transfer_mask,
-                    # Current/Final Top K data
-                    "top_k_tokens": top_k_final_token_list,
-                    "top_k_probs": top_k_final_prob_list,
-                    "top_k_probs_original": top_k_final_prob_orig_list,
-                    # Original Top K data
-                    "top_k_orig_tokens": top_k_orig_token_list,
-                    "top_k_orig_probs": top_k_orig_prob_list,
-                    "top_k_orig_probs_final": top_k_orig_prob_final_list,
+                    frame_data["batches"].append({
+                        "tokens": display_tokens,
+                        "is_mask": [tid == self.mask_token_id for tid in raw_ids],
+                        "is_special": special_mask,
+                        "is_flip": batch_flips,
+                        "is_unmasked_next": batch_transfer_mask,
+                        # Current/Final Top K data
+                        "top_k_tokens": top_k_final_token_list,
+                        "top_k_probs": top_k_final_prob_list,
+                        "top_k_probs_original": top_k_final_prob_orig_list,
+                        # Original Top K data
+                        "top_k_orig_tokens": top_k_orig_token_list,
+                        "top_k_orig_probs": top_k_orig_prob_list,
+                        "top_k_orig_probs_final": top_k_orig_prob_final_list,
 
-                    "entropy": metadata["entropy_map"][b].tolist() if len(metadata["entropy_map"]) > 0 else [],
-                    "force": metadata["force_map"][b].tolist() if len(metadata["force_map"]) > 0 else []
-                })
-            history_frames.append(frame_data)
+                        "entropy": metadata["entropy_map"][b].tolist() if len(metadata["entropy_map"]) > 0 else [],
+                        "force": metadata["force_map"][b].tolist() if len(metadata["force_map"]) > 0 else []
+                    })
+                history_frames.append(frame_data)
 
-            x[transfer_index] = x0[transfer_index]
+                x[transfer_index] = x0[transfer_index]
 
         final_frame = {"step": steps, "alpha": 0.0, "batches": []}
         samples = self.tokenizer.batch_decode(x[:, prompt_len:], skip_special_tokens=True)

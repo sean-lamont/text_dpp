@@ -71,8 +71,6 @@ def main(cfg: DictConfig):
     for i, s in enumerate(samples):
         print(f"[{i+1}] {s}")
 
-    if cfg.use_wandb:
-        wandb.finish()
 
 if __name__ == "__main__":
     main()

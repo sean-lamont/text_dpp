@@ -288,7 +288,7 @@ if __name__ == '__main__':
             dpp_strategy = get_strategy(strategy_name, alpha, quality_scale, feature_extractor)
             generator = DPPGenerator(model, tokenizer, dpp_strategy, mask_token_id)
 
-            data, _ = generator.generate(prompt_input, batch_size, steps, gen_len, temp, use_wandb=False)
+            data, _ = generator.generate(prompt_input, batch_size, steps, gen_len, temp,)
 
             run_record = {
                 "id": f"{timestamp} - {prompt_input[:20]}...",
