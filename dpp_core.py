@@ -108,6 +108,15 @@ class DPPStrategy(ABC):
         grad_safe = torch.where(max_norms > 0, grad / max_norms, grad)
         return grad_safe
 
+class BaselineStrategy(ABC):
+    def __init__(self):
+        super().__init__(self)
+        self.alpha = 0
+
+    # def apply(self, logits: torch.Tensor, mask_index: torch.Tensor, x: torch.Tensor,
+    #           history_vecs: List[torch.Tensor], history_qualities: List[float],
+    #           protected_tokens: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Dict]:
+    #     pass
 
 class SequentialSubtractionStrategy(DPPStrategy):
     def apply(self, logits: torch.Tensor, mask_index: torch.Tensor, x: torch.Tensor,
@@ -620,6 +629,8 @@ def get_strategy(name: str, alpha: float, quality_scale: float, feature_extracto
         return RandomProbeStrategy(alpha, quality_scale, feature_extractor)
     elif name == "joint":
         return JointStrategy(alpha, quality_scale, feature_extractor)
+    elif name == "baseline":
+        return BaselineStrategy()
     else:
         raise ValueError(f"Unknown strategy: {name}")
 
