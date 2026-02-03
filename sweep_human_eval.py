@@ -39,11 +39,7 @@ problem_list = list(problems_dict.values())
 # OPTUNA OBJECTIVE
 # -------------------------------------------------------------------
 def objective(trial):
-    strategy_name = trial.suggest_categorical("strategy.name", [
-        # "random_probe", "gram_schmidt", "orthogonal_projection",
-        "orthogonal_projection",
-        "joint", #"sequential_subtraction"
-    ])
+    strategy_name = trial.suggest_categorical("strategy.name", ["orthogonal_projection", "joint"])
 
     strategy_alpha = trial.suggest_float("strategy.alpha", 0.1, 100.0)
 
