@@ -41,7 +41,7 @@ problem_list = list(problems_dict.values())
 def objective(trial):
     strategy_name = trial.suggest_categorical("strategy.name", [
         # "random_probe", "gram_schmidt", "orthogonal_projection",
-        "orthogonal_projection"
+        "orthogonal_projection",
         "joint", #"sequential_subtraction"
     ])
 
