@@ -47,25 +47,22 @@ dataset = load_dataset("gsm8k", "main", split="test")
 # OPTUNA OBJECTIVE
 # -------------------------------------------------------------------
 def objective(trial):
-    # 1. Define Search Space
     strategy_name = trial.suggest_categorical("strategy.name", [
-        "random_probe", "gram_schmidt", "orthogonal_projection",
+        # "random_probe", "gram_schmidt", "orthogonal_projection",
+        "orthogonal_projection"
         "joint", #"sequential_subtraction"
     ])
 
-    # Conditional Hyperparameters
     strategy_alpha = trial.suggest_float("strategy.alpha", 0.1, 100.0)
 
-    # strategy_quality = trial.suggest_float("strategy.quality_scale", 0.1, 2.0)
-    strategy_quality = 1.0
+    strategy_quality = trial.suggest_float("strategy.quality_scale", 0.1, 2.0)
+    # strategy_quality = 1.0
 
 
     strategy_target = trial.suggest_categorical("strategy.target", ["logits", "embeddings"])
     strategy_pool = trial.suggest_categorical("strategy.pool", ["max", "mean", "positional"])
 
-
-    temperature = 1.0
-    # temperature = trial.suggest_float("temperature", 0.0, 1.5)
+    temperature = trial.suggest_float("temperature", 0.0, 1.5)
 
     # Sweep Constants
     batch_size = 8
@@ -204,11 +201,11 @@ if __name__ == "__main__":
     storage_url = "postgresql://optuna_user:secure_password@127.0.0.1:5432/optuna"
 
     study = optuna.create_study(
-        study_name="gsm8k_sweep",
+        study_name="gsm8k_sweep_2",
         storage=storage_url,  # <--- Updated
         load_if_exists=True,
         direction="maximize",
-        sampler=optuna.samplers.TPESampler(n_startup_trials=100),
+        sampler=optuna.samplers.TPESampler(n_startup_trials=50),
         pruner=optuna.pruners.HyperbandPruner(
             min_resource=100,  # Don't prune before step 10 (Critical for stability!)
             reduction_factor=2

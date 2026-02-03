@@ -354,7 +354,7 @@ class JointStrategy(DPPStrategy):
         identity = torch.eye(K.shape[0], device=K.device)
         jitter = 1e-4
         q_mat = torch.outer(quals, quals)
-        L = K * (1 + self.quality_scale * q_mat)
+        L = K * (self.quality_scale * q_mat)
         loss = -(torch.logdet(L + jitter * identity) - torch.logdet(L + identity + jitter * identity))
 
         raw_grads = torch.autograd.grad(loss, logits_in)[0]
