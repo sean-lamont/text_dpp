@@ -208,7 +208,11 @@ if __name__ == "__main__":
         storage=storage_url,  # <--- Updated
         load_if_exists=True,
         direction="maximize",
-        sampler=optuna.samplers.TPESampler()
+        sampler=optuna.samplers.TPESampler(n_startup_trials=100),
+        pruner=optuna.pruners.HyperbandPruner(
+            min_resource=100,  # Don't prune before step 10 (Critical for stability!)
+            reduction_factor=2
+        )
     )
 
 
