@@ -187,7 +187,7 @@ if __name__ == "__main__":
     storage_url = "postgresql://optuna_user:secure_password@127.0.0.1:5432/optuna"
 
     study = optuna.create_study(
-        study_name="human_eval_sweep",
+        study_name="human_eval_sweep_2",
         storage=storage_url,  # <--- Updated
         load_if_exists=True,
         direction="maximize",
