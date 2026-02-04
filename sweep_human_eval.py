@@ -43,8 +43,8 @@ def objective(trial):
 
     strategy_alpha = trial.suggest_float("strategy.alpha", 0.1, 100.0)
 
-    strategy_quality = trial.suggest_float("strategy.quality_scale", 0.1, 2.0)
-    # strategy_quality = 1.0
+    # strategy_quality = trial.suggest_float("strategy.quality_scale", 0.1, 2.0)
+    strategy_quality = 1.0
 
 
     strategy_target = trial.suggest_categorical("strategy.target", ["logits", "embeddings"])
@@ -92,6 +92,8 @@ def objective(trial):
             embedding_matrix=embedding_matrix,
             kernel_target=cfg.strategy.target,
             pooling_method=cfg.strategy.pool,
+            top_k=cfg.strategy.get("top_k", 0),
+            use_confidence_weighting=cfg.get('use_confidence_weighting', False)
         )
 
         dpp_strategy = get_strategy(

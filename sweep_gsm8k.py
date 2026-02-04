@@ -48,16 +48,15 @@ dataset = load_dataset("gsm8k", "main", split="test")
 # -------------------------------------------------------------------
 def objective(trial):
     strategy_name = trial.suggest_categorical("strategy.name", [
-        # "random_probe", "gram_schmidt", "orthogonal_projection",
+        # "random_probe", "gram_schmidt",
         "orthogonal_projection",
-        "joint" #"sequential_subtraction"
+        "joint"  # "sequential_subtraction"
     ])
 
     strategy_alpha = trial.suggest_float("strategy.alpha", 0.1, 100.0)
 
-    strategy_quality = trial.suggest_float("strategy.quality_scale", 0.1, 2.0)
-    # strategy_quality = 1.0
-
+    # strategy_quality = trial.suggest_float("strategy.quality_scale", 0.1, 2.0)
+    strategy_quality = 1.0
 
     strategy_target = trial.suggest_categorical("strategy.target", ["logits", "embeddings"])
     strategy_pool = trial.suggest_categorical("strategy.pool", ["max", "mean", "positional"])
@@ -102,7 +101,8 @@ def objective(trial):
             embedding_matrix=embedding_matrix,
             kernel_target=cfg.strategy.target,
             pooling_method=cfg.strategy.pool,
-            top_k=cfg.strategy.get("top_k", 0)
+            top_k=cfg.strategy.get("top_k", 0),
+            use_confidence_weighting=cfg.get('use_confidence_weighting', False)
         )
 
         dpp_strategy = get_strategy(
@@ -212,14 +212,13 @@ if __name__ == "__main__":
         )
     )
 
-
     # study = optuna.create_study(
     #     direction="maximize",
     #     sampler=optuna.samplers.TPESampler(seed=42)
     # )
 
     print(">>> STARTING OPTUNA SWEEP")
-    study.optimize(objective) #, n_trials=50)
+    study.optimize(objective)  # , n_trials=50)
 
     print(">>> SWEEP COMPLETE")
     print("Best params:", study.best_params)
