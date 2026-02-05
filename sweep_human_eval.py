@@ -19,12 +19,14 @@ from dpp_gen import load_model
 from utils import calculate_diversity_score
 from sentence_transformers import SentenceTransformer
 
+
 def clean_code_for_harness(prompt, completion):
     if "```python" in completion:
         completion = completion.split("```python")[1].split("```")[0]
     elif "```" in completion:
         completion = completion.split("```")[1].split("```")[0]
     return completion
+
 
 print(">>> Initializing Global Resources for Sweep...")
 with hydra.initialize(version_base=None, config_path="conf"):
@@ -35,30 +37,33 @@ eval_model = SentenceTransformer('all-MiniLM-L6-v2')
 problems_dict = read_problems()
 problem_list = list(problems_dict.values())
 
+
 # -------------------------------------------------------------------
 # OPTUNA OBJECTIVE
 # -------------------------------------------------------------------
 def objective(trial):
-    # strategy_name = trial.suggest_categorical("strategy.name", ["orthogonal_projection"])#, "joint"])
+    # strategy_name = trial.suggest_categorical("strategy.name", [
+    #     # "random_probe", "gram_schmidt",
+    #     "orthogonal_projection",
+    #     "joint"  # "sequential_subtraction"
+    # ])
+
     strategy_name = "orthogonal_projection"
 
     strategy_alpha = trial.suggest_float("strategy.alpha", 0.1, 100.0)
 
-    # strategy_quality = trial.suggest_float("strategy.quality_scale", 0.1, 2.0)
-    strategy_quality = 1.0
-
+    strategy_quality = trial.suggest_float("strategy.quality_scale", 0.1, 2.0)
+    # strategy_quality = 1.0
 
     strategy_target = trial.suggest_categorical("strategy.target", ["logits", "embeddings"])
     strategy_pool = trial.suggest_categorical("strategy.pool", ["max", "mean", "positional"])
 
     temperature = trial.suggest_float("temperature", 0.0, 1.5)
-    # temperature = 1.0
 
     # Sweep Constants
     batch_size = 8
-    n_problems = 164 # HumanEval has 164 problems
+    n_problems = 164  # HumanEval has 164 problems
     steps = 32
-
 
     # 2. Merge Config
     cfg = base_cfg.copy()
@@ -75,7 +80,7 @@ def objective(trial):
     # 3. Init W&B Run
     run_name = f"trial_{trial.number}_{strategy_name}"
     run = wandb.init(
-        project="humaneval_sweep",
+        project="humaneval_orth_sweep",
         group="tpe_l64",
         name=run_name,
         config=OmegaConf.to_container(cfg, resolve=True),
@@ -150,7 +155,7 @@ def objective(trial):
 
             # W&B Logging
             for s, cleaned_s, res in batch_results:
-                 results_table.add_data(task_id, prompt, cleaned_s, res['result'], res['passed'], div)
+                results_table.add_data(task_id, prompt, cleaned_s, res['result'], res['passed'], div)
 
             wandb.log({
                 "problem_idx": i,
@@ -191,12 +196,11 @@ if __name__ == "__main__":
         load_if_exists=True,
         direction="maximize",
         # sampler=optuna.samplers.TPESampler()
-        sampler = optuna.samplers.TPESampler(n_startup_trials=50),
-        pruner = optuna.pruners.HyperbandPruner(
-        min_resource=60,  # Don't prune before step 10 (Critical for stability!)
-        reduction_factor=2
-    )
-
+        sampler=optuna.samplers.TPESampler(n_startup_trials=50),
+        pruner=optuna.pruners.HyperbandPruner(
+            min_resource=60,  # Don't prune before step 10 (Critical for stability!)
+            reduction_factor=2
+        )
 
     )
 
