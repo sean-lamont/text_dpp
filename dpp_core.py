@@ -13,7 +13,7 @@ class FeatureExtractor:
                  pooling_method: str = 'max',
                  top_k: int = 0,
                  seq_len_scale: int = 64,
-                 use_confidence_weighting: bool = False):
+                 use_confidence_weighting: bool = True):
 
         self.embedding_matrix = embedding_matrix
         self.kernel_target = kernel_target
@@ -156,8 +156,8 @@ class SequentialSubtractionStrategy(DPPStrategy):
                     )
 
                     dot = torch.dot(norm_vec.view(-1), q.view(-1))
-                    # loss = (dot ** 2) * (self.quality_scale * qual)
-                    loss = (dot ** 2) * (self.quality_scale * qual.detach())
+                    loss = (dot ** 2) * (self.quality_scale * qual)
+                    # loss = (dot ** 2) * (self.quality_scale * qual.detach())
 
                     grad = torch.autograd.grad(loss, curr_logits_k)[0]
                     grad = self._normalize_gradient(grad, protected_tokens)
@@ -211,8 +211,8 @@ class GramSchmidtStrategy(DPPStrategy):
                     dot = torch.dot(norm_vec_k.view(-1), q.view(-1))
                     similarity_loss = similarity_loss + (dot ** 2)
 
-                # weighted_loss = similarity_loss * (self.quality_scale * qual_k)
-                weighted_loss = similarity_loss * (self.quality_scale * qual_k.detach())
+                weighted_loss = similarity_loss * (self.quality_scale * qual_k)
+                # weighted_loss = similarity_loss * (self.quality_scale * qual_k.detach())
                 raw_grads = torch.autograd.grad(weighted_loss, logit_k)[0]
                 final_grads[k] = self._normalize_gradient(raw_grads, protected_tokens).squeeze(0)
 
@@ -271,8 +271,8 @@ class RandomProbeStrategy(DPPStrategy):
                 if probe_norm > 1e-6:
                     target_dir = probe / probe_norm
                     alignment = torch.dot(norm_vec_k.view(-1), target_dir.view(-1))
-                    # loss = -alignment * (self.quality_scale * qual_k)
-                    loss = -alignment * (self.quality_scale * qual_k.detach())
+                    loss = -alignment * (self.quality_scale * qual_k)
+                    # loss = -alignment * (self.quality_scale * qual_k.detach())
 
                     if loss.requires_grad:
                         raw_grads = torch.autograd.grad(loss, logit_k)[0]
@@ -331,9 +331,8 @@ class OrthogonalProjectionStrategy(DPPStrategy):
                 if target_norm > 1e-6:
                     target_dir = v_target / target_norm
                     alignment = torch.dot(norm_vec_k.view(-1), target_dir.view(-1))
-                    # loss = -alignment * (self.quality_scale * qual_k)
-                    # detach so model only changes tokens based on diversity, with quality as a scaling factor
-                    loss = -alignment * (self.quality_scale * qual_k.detach())
+                    loss = -alignment * (self.quality_scale * qual_k)
+                    # loss = -alignment * (self.quality_scale * qual_k.detach())
 
                     if loss.requires_grad:
                         raw_grads = torch.autograd.grad(loss, logit_k)[0]
@@ -368,13 +367,13 @@ class JointStrategy(DPPStrategy):
         identity = torch.eye(K.shape[0], device=K.device)
         jitter = 1e-4
 
-        # q_mat = torch.outer(quals, quals)
-        # L = K * (self.quality_scale * q_mat)
+        q_mat = torch.outer(quals, quals)
+        L = K * (self.quality_scale * q_mat)
 
-        quals_detached = quals.detach()
-        q_mat = torch.outer(quals_detached, quals_detached)
+        # quals_detached = quals.detach()
+        # q_mat = torch.outer(quals_detached, quals_detached)
+        # L = K * (self.quality_scale * q_mat.detach())
 
-        L = K * (self.quality_scale * q_mat.detach())
         loss = -(torch.logdet(L + jitter * identity) - torch.logdet(L + identity + jitter * identity))
 
         raw_grads = torch.autograd.grad(loss, logits_in)[0]

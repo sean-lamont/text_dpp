@@ -102,7 +102,7 @@ def objective(trial):
             kernel_target=cfg.strategy.target,
             pooling_method=cfg.strategy.pool,
             top_k=cfg.strategy.get("top_k", 0),
-            use_confidence_weighting=cfg.get('use_confidence_weighting', False)
+            use_confidence_weighting=cfg.get('use_confidence_weighting', True)
         )
 
         dpp_strategy = get_strategy(

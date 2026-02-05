@@ -39,7 +39,8 @@ problem_list = list(problems_dict.values())
 # OPTUNA OBJECTIVE
 # -------------------------------------------------------------------
 def objective(trial):
-    strategy_name = trial.suggest_categorical("strategy.name", ["orthogonal_projection", "joint"])
+    # strategy_name = trial.suggest_categorical("strategy.name", ["orthogonal_projection"])#, "joint"])
+    strategy_name = "orthogonal_projection"
 
     strategy_alpha = trial.suggest_float("strategy.alpha", 0.1, 100.0)
 
@@ -93,7 +94,7 @@ def objective(trial):
             kernel_target=cfg.strategy.target,
             pooling_method=cfg.strategy.pool,
             top_k=cfg.strategy.get("top_k", 0),
-            use_confidence_weighting=cfg.get('use_confidence_weighting', False)
+            use_confidence_weighting=cfg.get('use_confidence_weighting', True)
         )
 
         dpp_strategy = get_strategy(
