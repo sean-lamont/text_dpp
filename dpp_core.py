@@ -116,15 +116,16 @@ class DPPStrategy(ABC):
         return grad_safe
 
 
-class BaselineStrategy(ABC):
+class BaselineStrategy(DPPStrategy):
     def __init__(self):
-        super().__init__(self)
+        # init super
+        super().__init__(0.0, 0.0, None)
         self.alpha = 0
 
-    # def apply(self, logits: torch.Tensor, mask_index: torch.Tensor, x: torch.Tensor,
-    #           history_vecs: List[torch.Tensor], history_qualities: List[float],
-    #           protected_tokens: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Dict]:
-    #     pass
+    def apply(self, logits: torch.Tensor, mask_index: torch.Tensor, x: torch.Tensor,
+              history_vecs: List[torch.Tensor], history_qualities: List[float],
+              protected_tokens: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Dict]:
+        pass
 
 
 class SequentialSubtractionStrategy(DPPStrategy):

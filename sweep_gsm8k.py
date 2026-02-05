@@ -53,15 +53,19 @@ def objective(trial):
     #     "joint"  # "sequential_subtraction"
     # ])
 
-    strategy_name = "orthogonal_projection"
+    strategy_name = "baseline"
 
-    strategy_alpha = trial.suggest_float("strategy.alpha", 0.1, 100.0)
+    # strategy_alpha = trial.suggest_float("strategy.alpha", 0.1, 100.0)
+    strategy_alpha = 0.0
 
-    strategy_quality = trial.suggest_float("strategy.quality_scale", 0.1, 2.0)
-    # strategy_quality = 1.0
+    # strategy_quality = trial.suggest_float("strategy.quality_scale", 0.1, 2.0)
+    strategy_quality = 1.0
 
-    strategy_target = trial.suggest_categorical("strategy.target", ["logits", "embeddings"])
-    strategy_pool = trial.suggest_categorical("strategy.pool", ["max", "mean", "positional"])
+    # strategy_target = trial.suggest_categorical("strategy.target", ["logits", "embeddings"])
+    # strategy_pool = trial.suggest_categorical("strategy.pool", ["max", "mean", "positional"])
+
+    strategy_target = "logits"
+    strategy_pool = "max"
 
     temperature = trial.suggest_float("temperature", 0.0, 1.5)
 
@@ -203,7 +207,7 @@ if __name__ == "__main__":
     storage_url = "postgresql://optuna_user:secure_password@127.0.0.1:5432/optuna"
 
     study = optuna.create_study(
-        study_name="gsm8k_orth_sweep",
+        study_name="gsm8k_baseline",
         storage=storage_url,  # <--- Updated
         load_if_exists=True,
         direction="maximize",
