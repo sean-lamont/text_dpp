@@ -69,6 +69,9 @@ def objective(trial):
 
     temperature = trial.suggest_float("temperature", 0.0, 1.5)
 
+    # ignore_pad = trial.suggest_categorical("ignore_pad", [True, False])
+    ignore_pad = False
+
     # Sweep Constants
     batch_size = 8
     n_problems = 300
@@ -85,6 +88,7 @@ def objective(trial):
     cfg.temperature = temperature
     cfg.batch_size = batch_size
     cfg.steps = steps
+    cfg.ignore_pad = ignore_pad
 
     # 3. Init W&B Run
     run_name = f"trial_{trial.number}_{strategy_name}"
@@ -108,7 +112,8 @@ def objective(trial):
             kernel_target=cfg.strategy.target,
             pooling_method=cfg.strategy.pool,
             top_k=cfg.strategy.get("top_k", 0),
-            use_confidence_weighting=cfg.get('use_confidence_weighting', True)
+            use_confidence_weighting=cfg.get('use_confidence_weighting', True),
+            ignore_token_ids=[tokenizer.pad_token_id] if cfg.get('ignore_pad',False) else []
         )
 
         dpp_strategy = get_strategy(

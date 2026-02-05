@@ -13,7 +13,8 @@ class FeatureExtractor:
                  pooling_method: str = 'max',
                  top_k: int = 0,
                  seq_len_scale: int = 64,
-                 use_confidence_weighting: bool = True):
+                 use_confidence_weighting: bool = True,
+                 ignore_token_ids: List = []):
 
         self.embedding_matrix = embedding_matrix
         self.kernel_target = kernel_target
@@ -21,6 +22,7 @@ class FeatureExtractor:
         self.top_k = top_k
         self.seq_len_scale = seq_len_scale
         self.use_confidence_weighting = use_confidence_weighting
+        self.ignore_token_ids = ignore_token_ids
 
     def extract(self, logit_k: torch.Tensor, mask_k: torch.Tensor, x_k: torch.Tensor) -> Tuple[
         torch.Tensor, torch.Tensor]:
@@ -32,6 +34,9 @@ class FeatureExtractor:
         if x_k.dim() == 1: x_k = x_k.unsqueeze(0)
 
         probs = torch.softmax(logit_k, dim=-1)
+
+        if self.ignore_token_ids:
+            probs[..., self.ignore_token_ids] = 0.0
 
         if self.top_k > 0:
             vals, indices = torch.topk(probs, k=self.top_k, dim=-1)
@@ -419,6 +424,7 @@ class DPPGenerator:
             num_transfer_tokens[i, :remainder[i]] += 1
         return num_transfer_tokens
 
+    # todo update to handle larger batches with inner batch_size (where batch_size = n * inner_batch_size)
     def generate(self, prompt: str, batch_size: int, steps: int, gen_length: int, temperature: float,
                  ) -> Tuple[List[Dict], List[str]]:
 
@@ -430,6 +436,7 @@ class DPPGenerator:
         attention_mask = encoded.attention_mask.to(self.device)
 
         prompt_len = prompt_ids.shape[1]
+
         x = torch.full((batch_size, prompt_len + gen_length), self.mask_token_id, dtype=torch.long).to(self.device)
         x[:, :prompt_len] = prompt_ids.clone()
 
@@ -439,6 +446,7 @@ class DPPGenerator:
 
         mask_index_init = (x[:, prompt_len:] == self.mask_token_id)
         num_transfer_tokens_schedule = self.get_num_transfer_tokens(mask_index_init, steps)
+
         protected_tokens = torch.tensor([self.tokenizer.eos_token_id, self.tokenizer.pad_token_id], device=self.device)
 
         history_frames = []
@@ -447,7 +455,11 @@ class DPPGenerator:
             mask_index = (x == self.mask_token_id)
 
             with torch.no_grad():
+                # todo should just deconstruct and reconstruct to loop n times with model for inner_batch_size
+                # ---
                 logits = self.model(x, attention_mask=attention_mask).logits
+                # ---
+
                 gen_logits = logits[:, prompt_len:, :].clone()
 
             # Decay alpha
@@ -467,7 +479,7 @@ class DPPGenerator:
                 probs_original = torch.softmax(gen_logits, dim=-1)
                 top1_original = torch.argmax(probs_original, dim=-1)
 
-                # Get Top K of Original Distribution
+                # Get Top K of Original Distribution for logging
                 k_val = 5
                 topk_probs_orig, topk_indices_orig = torch.topk(probs_original, k=k_val, dim=-1)
 
