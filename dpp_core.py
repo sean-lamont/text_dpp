@@ -405,28 +405,32 @@ class DPPGenerator:
         entropy_map = -torch.sum(probs * log_probs, dim=-1)
         return {"entropy_map": entropy_map.detach().float().cpu()}
 
+    def sample_gumbel_efficient(self, logits, temperature):
+        if temperature == 0:
+            return torch.argmax(logits, dim=-1)
+
+        output_indices = torch.empty(logits.shape[:-1], dtype=torch.long, device=logits.device)
+
+        # instead of casting the whole matrix to float64, we do it for 1 batch item at a time.
+        for i in range(logits.shape[0]):
+            logit_slice = logits[i].to(torch.float64)
+
+            noise = torch.rand_like(logit_slice, dtype=torch.float64)
+
+            gumbel_noise = (-torch.log(noise)) ** temperature
+            noisy_logits = logit_slice.exp() / gumbel_noise
+
+            output_indices[i] = torch.argmax(noisy_logits, dim=-1)
+
+        return output_indices
+
     def add_gumbel_noise(self, logits, temperature):
         if temperature == 0:
             return logits
-
-        logits = logits.to(torch.float32)
-
-        # Generate noise in float32
-        noise = torch.rand_like(logits, dtype=torch.float32)
-
-        # Add epsilon (1e-10) to prevent log(0) errors.
-        # This replaces the need for float64's extra precision.
-        gumbel_noise = (-torch.log(noise + 1e-10)) ** temperature
-
+        logits = logits.to(torch.float64)
+        noise = torch.rand_like(logits, dtype=torch.float64)
+        gumbel_noise = (- torch.log(noise)) ** temperature
         return logits.exp() / gumbel_noise
-
-    # def add_gumbel_noise(self, logits, temperature):
-    #     if temperature == 0:
-    #         return logits
-    #     logits = logits.to(torch.float64)
-    #     noise = torch.rand_like(logits, dtype=torch.float64)
-    #     gumbel_noise = (- torch.log(noise)) ** temperature
-    #     return logits.exp() / gumbel_noise
 
     def get_num_transfer_tokens(self, mask_index, steps):
         mask_num = mask_index.sum(dim=1, keepdim=True)
@@ -537,8 +541,11 @@ class DPPGenerator:
                 topk_probs_final_at_orig = torch.gather(probs_final, -1, topk_indices_orig)
 
                 # 3. Sampling Logic (Calculate transfer_index but don't apply yet)
-                logits_with_noise = self.add_gumbel_noise(logits, temperature=temperature)
-                x0 = torch.argmax(logits_with_noise, dim=-1)
+                # logits_with_noise = self.add_gumbel_noise(logits, temperature=temperature)
+                # x0 = torch.argmax(logits_with_noise, dim=-1)
+
+                # Use the memory-efficient version that fuses argmax
+                x0 = self.sample_gumbel_efficient(logits, temperature)
 
                 p = F.softmax(logits, dim=-1)
                 x0_p = torch.squeeze(torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1)
