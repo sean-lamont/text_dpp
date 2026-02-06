@@ -408,10 +408,25 @@ class DPPGenerator:
     def add_gumbel_noise(self, logits, temperature):
         if temperature == 0:
             return logits
-        logits = logits.to(torch.float64)
-        noise = torch.rand_like(logits, dtype=torch.float64)
-        gumbel_noise = (- torch.log(noise)) ** temperature
+
+        logits = logits.to(torch.float32)
+
+        # Generate noise in float32
+        noise = torch.rand_like(logits, dtype=torch.float32)
+
+        # Add epsilon (1e-10) to prevent log(0) errors.
+        # This replaces the need for float64's extra precision.
+        gumbel_noise = (-torch.log(noise + 1e-10)) ** temperature
+
         return logits.exp() / gumbel_noise
+
+    # def add_gumbel_noise(self, logits, temperature):
+    #     if temperature == 0:
+    #         return logits
+    #     logits = logits.to(torch.float64)
+    #     noise = torch.rand_like(logits, dtype=torch.float64)
+    #     gumbel_noise = (- torch.log(noise)) ** temperature
+    #     return logits.exp() / gumbel_noise
 
     def get_num_transfer_tokens(self, mask_index, steps):
         mask_num = mask_index.sum(dim=1, keepdim=True)
