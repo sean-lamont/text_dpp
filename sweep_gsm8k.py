@@ -4,7 +4,7 @@ import optuna
 import wandb
 import numpy as np
 from omegaconf import OmegaConf
-from sklearn.model_selection import ParameterGrid  # <--- Added for Grid Generation
+from sklearn.model_selection import ParameterGrid
 
 # Import your existing project modules
 from dpp_core import FeatureExtractor, get_strategy, DPPGenerator
@@ -15,8 +15,9 @@ from datasets import load_dataset
 from sentence_transformers import SentenceTransformer
 
 
-# ... [Keep your regex helper functions here: extract_answer_num, extract_gold_num] ...
-
+# -------------------------------------------------------------------
+# HELPER FUNCTIONS
+# -------------------------------------------------------------------
 def extract_answer_num(text):
     try:
         text = text.replace(',', '')
@@ -50,20 +51,22 @@ dataset = load_dataset("gsm8k", "main", split="test")
 # OPTUNA OBJECTIVE
 # -------------------------------------------------------------------
 def objective(trial):
+    # 1. Receive Parameters
     strategy_alpha = trial.suggest_categorical("strategy.alpha", [2.0, 8.0, 16.0, 32.0, 64.0, 128.0])
     temperature = trial.suggest_categorical("temperature", [0.0, 0.5, 1.0, 1.5, 2.0])
-    batch_size = trial.suggest_categorical("batch_size", [8, 4, 2])
 
+    # Fixed Constants (Matching HumanEval Slicing Setup)
     strategy_name = "orthogonal_projection"
     strategy_quality = 1.0
     strategy_target = "logits"
     strategy_pool = "max"
     ignore_pad = False
 
-    # Sweep Constants
-    n_problems = 200
+    batch_size = 16  # Fixed to 16 for slicing strategy
+    n_problems = 200  # Subset for speed
     steps = 32
 
+    # 2. Merge Config
     cfg = base_cfg.copy()
     if "strategy" not in cfg: cfg.strategy = {}
     cfg.strategy.name = strategy_name
@@ -76,10 +79,11 @@ def objective(trial):
     cfg.steps = steps
     cfg.ignore_pad = ignore_pad
 
-    run_name = f"trial_{trial.number}_alpha{strategy_alpha}_temp{temperature}"
+    # 3. Init W&B Run
+    run_name = f"trial_{trial.number}_{strategy_name}_alpha{strategy_alpha}_temp{temperature}"
     run = wandb.init(
-        project="gsm8k_eval",
-        group="grid_search_v1",
+        project="gsm8k",
+        group="orth_eval",
         name=run_name,
         config=OmegaConf.to_container(cfg, resolve=True),
         reinit=True
@@ -88,16 +92,13 @@ def objective(trial):
     results_table = wandb.Table(columns=["question", "gold", "generated", "is_correct", "diversity"])
 
     try:
-        print(f"\n>>> STARTING TRIAL {trial.number}: Alpha={strategy_alpha}, Temp={temperature}")
+        print(f"\n>>> STARTING TRIAL {trial.number}: Alpha={strategy_alpha}, Temp={temperature}, Batch={batch_size}")
 
-        # Prepare Strategy
         feature_extractor = FeatureExtractor(
             embedding_matrix=embedding_matrix,
             kernel_target=cfg.strategy.target,
             pooling_method=cfg.strategy.pool,
             top_k=cfg.strategy.get("top_k", 0),
-            # use_confidence_weighting=True, # Restore if using confidence
-            # ignore_token_ids=[tokenizer.pad_token_id] # Restore if using PAD masking
         )
 
         dpp_strategy = get_strategy(
@@ -109,8 +110,11 @@ def objective(trial):
 
         generator = DPPGenerator(model, tokenizer, dpp_strategy, mask_token_id)
 
-        pass_k_list = []
+        # Metrics Storage
+        pass_at_k_totals = {k: [] for k in range(1, batch_size + 1)}
+        cumulative_totals = {k: 0 for k in range(1, batch_size + 1)}
         diversity_scores = []
+        gen_times = []
 
         problem_indices = range(len(dataset)) if n_problems == -1 else range(min(n_problems, len(dataset)))
 
@@ -123,6 +127,7 @@ def objective(trial):
             formatted_prompt = f"Question: {q}\nLet's think step by step.\nAnswer:"
 
             start_t = time.time()
+
             # Generate
             _, samples = generator.generate(
                 prompt=formatted_prompt,
@@ -132,53 +137,59 @@ def objective(trial):
                 temperature=cfg.temperature,
             )
 
-            # Evaluate
-            correct_count = 0
+            gen_times.append(time.time() - start_t)
+
+            # Evaluate Batch
+            correct_flags = []
             for s in samples:
                 val = extract_answer_num(s)
-                if val is not None and abs(val - gold) < 1e-4:
-                    correct_count += 1
+                is_correct = (val is not None and abs(val - gold) < 1e-4)
+                correct_flags.append(is_correct)
 
-            pk = 1 if correct_count > 0 else 0
+            # Calculate Empirical Pass@k by slicing
+            cumulative_correct = 0
+            for k in range(1, batch_size + 1):
+                # If any of the first k samples is correct, then pass@k = 1.0
+                score = 1.0 if any(correct_flags[:k]) else 0.0
+                cumulative_correct += score
+                pass_at_k_totals[k].append(score)
+                cumulative_totals[k] = cumulative_correct
+
             div = calculate_diversity_score(eval_model, samples)
-
-            pass_k_list.append(pk)
             diversity_scores.append(div)
 
-            print(
-                f"Correct: {correct_count}/{len(samples)} | Pass@{cfg.batch_size}: {pk:.2f} | Div: {div:.3f} | Time: {time.time() - start_t:.1f}s")
+            for s, is_correct in zip(samples, correct_flags):
+                results_table.add_data(q, gold, s, is_correct, div)
 
-            # W&B Logging
-            is_correct_batch = (correct_count > 0)
-            results_table.add_data(q, gold, samples[0], is_correct_batch, div)
-            for sample in samples[1:]:
-                results_table.add_data('', gold, sample, is_correct_batch, div)
+            print(f"Correct: {cumulative_correct} | Time: {gen_times[-1]:.2f}s")
 
-            # Report intermediate progress
-            wandb.log({
-                "problem_idx": i,
-                "pass_k_sample": pk,
-                "diversity_sample": div,
-                "batch_correct": correct_count,
-                "int_passk": np.mean(pass_k_list)
-            })
+        # Aggregate Results
+        avg_pass_at_k = {f"pass_at_{k}": np.mean(v) for k, v in pass_at_k_totals.items()}
+        avg_cumulative_at_k = {f"cumulative_at_{k}": np.mean(v) for k, v in cumulative_totals.items()}
 
-            trial.report(np.mean(pass_k_list), i)
-
-            # if trial.should_prune(): raise optuna.TrialPruned()
-
-        avg_pass_k = np.mean(pass_k_list) if pass_k_list else 0.0
         avg_div = np.mean(diversity_scores) if diversity_scores else 0.0
+        std_div = np.std(diversity_scores) if diversity_scores else 0.0
+        avg_time = np.mean(gen_times) if gen_times else 0.0
+        std_time = np.std(gen_times) if gen_times else 0.0
 
-        print(f"RESULTS (Trial {trial.number}): Pass@K: {avg_pass_k:.4f} | Diversity: {avg_div:.4f}")
+        target_metric = avg_pass_at_k[f"pass_at_{batch_size}"]
 
-        wandb.log({
-            "pass_k": avg_pass_k,
+        print(
+            f"RESULTS: Pass@1: {avg_pass_at_k['pass_at_1']:.4f} | Pass@{batch_size}: {target_metric:.4f} | Div: {avg_div:.4f}")
+
+        log_dict = {
             "avg_diversity": avg_div,
-            "results_table": results_table
-        })
+            "std_diversity": std_div,
+            "avg_time": avg_time,
+            "std_time": std_time,
+            "results_table": results_table,
+        }
+        log_dict.update(avg_pass_at_k)
+        log_dict.update(avg_cumulative_at_k)
 
-        return avg_pass_k
+        wandb.log(log_dict)
+
+        return target_metric
 
     finally:
         wandb.finish()
@@ -187,44 +198,30 @@ def objective(trial):
 if __name__ == "__main__":
     storage_url = "postgresql://optuna_user:secure_password@127.0.0.1:5432/optuna"
 
-    # 1. Define the Grid Explicitly
-    # keys must match the `trial.suggest_categorical` names in objective()
+    # 1. Grid
     search_space = {
         "strategy.alpha": [2.0, 8.0, 16.0, 32.0, 64.0, 128.0],
-        "temperature": [0.0, 0.5, 1.0, 1.5, 2.0],
-        "batch_size": [8, 4, 2]
+        "temperature": [0.0, 0.5, 1.0, 1.5, 2.0]
     }
 
-    # 2. Define Repeats
     n_repeats = 8
 
-    # 3. Create Study
-    # Note: We use the default sampler (TPE) because we are forcing the trials via enqueue.
+    # 2. Study
     study = optuna.create_study(
-        study_name="gsm8k_eval_v3",  # Unique name for this experiment
+        study_name="gsm8k_orth_eval",
         storage=storage_url,
         load_if_exists=True,
         direction="maximize"
     )
 
-    print(f">>> Generatng Grid for {n_repeats} sweeps...")
+    # 3. Lazy Enqueue (Only if empty)
+    if len(study.trials) == 0:
+        print(f">>> Study is empty. Enqueuing grid for {n_repeats} sweeps...")
+        grid_list = list(ParameterGrid(search_space))
+        for r in range(n_repeats):
+            for params in grid_list:
+                study.enqueue_trial(params)
+    else:
+        print(f">>> Study exists ({len(study.trials)} trials). Starting worker...")
 
-    # 4. Enqueue Trials in Order
-    # We generate the list of parameters and add them to the study queue.
-    # Optuna will consume this queue first before sampling anything new.
-    grid_list = list(ParameterGrid(search_space))
-
-    for r in range(n_repeats):
-        print(f"  > Queueing Sweep {r + 1}/{n_repeats} ({len(grid_list)} trials)...")
-        for params in grid_list:
-            study.enqueue_trial(params)
-
-    total_trials = len(grid_list) * n_repeats
-    print(f">>> Starting Optimization: {total_trials} total trials scheduled.")
-
-    # 5. Run
-    study.optimize(objective, n_trials=total_trials)
-
-    print(">>> SWEEP COMPLETE")
-    print("Best params:", study.best_params)
-    print("Best pass@k:", study.best_value)
+    study.optimize(objective, n_trials=len(list(ParameterGrid(search_space))) * n_repeats)
