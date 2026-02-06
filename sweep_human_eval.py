@@ -45,7 +45,7 @@ problem_list = list(problems_dict.values())
 def objective(trial):
     strategy_alpha = trial.suggest_categorical("strategy.alpha", [2.0, 8.0, 16.0, 32.0, 64.0, 128.0])
     temperature = trial.suggest_categorical("temperature", [0.0, 0.5, 1.0, 1.5, 2.0])
-    batch_size = trial.suggest_categorical("batch_size", [2, 4, 8])
+    batch_size = trial.suggest_categorical("batch_size", [8, 4, 2])
 
     # Fixed Parameters for this Sweep
     strategy_name = "orthogonal_projection"
@@ -191,7 +191,7 @@ if __name__ == "__main__":
     search_space = {
         "strategy.alpha": [2.0, 8.0, 16.0, 32.0, 64.0, 128.0],
         "temperature": [0.0, 0.5, 1.0, 1.5, 2.0],
-        "batch_size" :  [2, 4, 8]
+        "batch_size" :  [8, 4, 2]
     }
 
     # 2. Define Repeats
@@ -199,7 +199,7 @@ if __name__ == "__main__":
 
     # 3. Create Study
     study = optuna.create_study(
-        study_name="humaneval_eval",  # Unique name for this experiment
+        study_name="humaneval_eval_2",  # Unique name for this experiment
         storage=storage_url,
         load_if_exists=True,
         direction="maximize"

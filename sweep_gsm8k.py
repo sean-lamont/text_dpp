@@ -122,6 +122,7 @@ def objective(trial):
 
             formatted_prompt = f"Question: {q}\nLet's think step by step.\nAnswer:"
 
+            start_t = time.time()
             # Generate
             _, samples = generator.generate(
                 prompt=formatted_prompt,
@@ -191,7 +192,7 @@ if __name__ == "__main__":
     search_space = {
         "strategy.alpha": [2.0, 8.0, 16.0, 32.0, 64.0, 128.0],
         "temperature": [0.0, 0.5, 1.0, 1.5, 2.0],
-        "batch_size": [8,4,2]
+        "batch_size": [8, 4, 2]
     }
 
     # 2. Define Repeats
@@ -200,7 +201,7 @@ if __name__ == "__main__":
     # 3. Create Study
     # Note: We use the default sampler (TPE) because we are forcing the trials via enqueue.
     study = optuna.create_study(
-        study_name="gsm8k_eval",  # Unique name for this experiment
+        study_name="gsm8k_eval_2",  # Unique name for this experiment
         storage=storage_url,
         load_if_exists=True,
         direction="maximize"
