@@ -7,6 +7,7 @@ import wandb
 import numpy as np
 from omegaconf import OmegaConf, DictConfig
 import re
+from sklearn.model_selection import ParameterGrid  # <--- Added for Grid Generation
 
 # Add human-eval to path to allow imports
 sys.path.append(os.path.join(os.getcwd(), "human-eval"))
@@ -42,34 +43,18 @@ problem_list = list(problems_dict.values())
 # OPTUNA OBJECTIVE
 # -------------------------------------------------------------------
 def objective(trial):
-    # strategy_name = trial.suggest_categorical("strategy.name", [
-    #     # "random_probe", "gram_schmidt",
-    #     "orthogonal_projection",
-    #     "joint"  # "sequential_subtraction"
-    # ])
+    strategy_alpha = trial.suggest_categorical("strategy.alpha", [2.0, 8.0, 16.0, 32.0, 64.0, 128.0])
+    temperature = trial.suggest_categorical("temperature", [0.0, 0.5, 1.0, 1.5, 2.0])
+    batch_size = trial.suggest_categorical("batch_size", [2, 4, 8])
 
-    strategy_name = "baseline"
-
-    # strategy_alpha = trial.suggest_float("strategy.alpha", 0.1, 100.0)
-    strategy_alpha = 0.0
-
-    # strategy_quality = trial.suggest_float("strategy.quality_scale", 0.1, 2.0)
+    # Fixed Parameters for this Sweep
+    strategy_name = "orthogonal_projection"
     strategy_quality = 1.0
-
-    # strategy_target = trial.suggest_categorical("strategy.target", ["logits", "embeddings"])
-    # strategy_pool = trial.suggest_categorical("strategy.pool", ["max", "mean", "positional"])
-
     strategy_target = "logits"
     strategy_pool = "max"
-
-    temperature = trial.suggest_float("temperature", 0.0, 1.5)
-
-    # ignore_pad = trial.suggest_categorical("ignore_pad", [True, False])
     ignore_pad = False
 
-    # Sweep Constants
-    batch_size = 8
-    n_problems = 164  # HumanEval has 164 problems
+    n_problems = -1
     steps = 32
 
     # 2. Merge Config
@@ -86,10 +71,10 @@ def objective(trial):
     cfg.ignore_pad = ignore_pad
 
     # 3. Init W&B Run
-    run_name = f"trial_{trial.number}_{strategy_name}"
+    run_name = f"trial_{trial.number}_{strategy_name}_alpha{strategy_alpha}_temp{temperature}"
     run = wandb.init(
-        project="humaneval_sweep",
-        group="tpe_l64",
+        project="humaneval_eval",
+        group="grid_search_v1",  # Updated group
         name=run_name,
         config=OmegaConf.to_container(cfg, resolve=True),
         reinit=True
@@ -99,7 +84,7 @@ def objective(trial):
     results_table = wandb.Table(columns=["task_id", "prompt", "completion", "result", "passed", "diversity"])
 
     try:
-        print(f"\n>>> STARTING TRIAL {trial.number}: {strategy_name} (alpha={strategy_alpha:.2f})")
+        print(f"\n>>> STARTING TRIAL {trial.number}: {strategy_name} (alpha={strategy_alpha:.2f}, temp={temperature})")
 
         # Prepare Strategy
         feature_extractor = FeatureExtractor(
@@ -123,14 +108,16 @@ def objective(trial):
         pass_k_list = []
         diversity_scores = []
 
-        # Limit problems if needed (e.g. debugging)
-        current_problems = problem_list[:n_problems]
+        if n_problems != -1:
+            current_problems = problem_list[:n_problems]
+        else:
+            current_problems = problem_list
 
         for i, problem in enumerate(current_problems):
             task_id = problem['task_id']
             prompt = problem['prompt']
 
-            print(f"\n--- Problem {i + 1}/{len(current_problems)}: {task_id} ---")
+            # print(f"\n--- Problem {i + 1}/{len(current_problems)}: {task_id} ---")
 
             start_t = time.time()
 
@@ -174,7 +161,7 @@ def objective(trial):
             })
 
             trial.report(np.mean(pass_k_list), i)
-            if trial.should_prune(): raise optuna.TrialPruned()
+            # if trial.should_prune(): raise optuna.TrialPruned()
 
         avg_pass_k = np.mean(pass_k_list) if pass_k_list else 0.0
         avg_div = np.mean(diversity_scores) if diversity_scores else 0.0
@@ -199,22 +186,40 @@ def objective(trial):
 if __name__ == "__main__":
     storage_url = "postgresql://optuna_user:secure_password@127.0.0.1:5432/optuna"
 
-    study = optuna.create_study(
-        study_name="human_eval_baseline",
-        storage=storage_url,  # <--- Updated
-        load_if_exists=True,
-        direction="maximize",
-        # sampler=optuna.samplers.TPESampler()
-        sampler=optuna.samplers.TPESampler(n_startup_trials=50),
-        pruner=optuna.pruners.HyperbandPruner(
-            min_resource=60,  # Don't prune before step 10 (Critical for stability!)
-            reduction_factor=2
-        )
+    # 1. Define the Grid Explicitly
+    # keys must match the `trial.suggest_categorical` names in objective()
+    search_space = {
+        "strategy.alpha": [2.0, 8.0, 16.0, 32.0, 64.0, 128.0],
+        "temperature": [0.0, 0.5, 1.0, 1.5, 2.0],
+        "batch_size" :  [2, 4, 8]
+    }
 
+    # 2. Define Repeats
+    n_repeats = 8  # <--- How many times to run the full grid
+
+    # 3. Create Study
+    study = optuna.create_study(
+        study_name="humaneval_eval",  # Unique name for this experiment
+        storage=storage_url,
+        load_if_exists=True,
+        direction="maximize"
     )
 
-    print(">>> STARTING OPTUNA SWEEP")
-    study.optimize(objective)
+    print(f">>> Generating Grid for {n_repeats} sweeps...")
+
+    # 4. Enqueue Trials in Order
+    grid_list = list(ParameterGrid(search_space))
+
+    for r in range(n_repeats):
+        print(f"  > Queueing Sweep {r + 1}/{n_repeats} ({len(grid_list)} trials)...")
+        for params in grid_list:
+            study.enqueue_trial(params)
+
+    total_trials = len(grid_list) * n_repeats
+    print(f">>> Starting Optimization: {total_trials} total trials scheduled.")
+
+    # 5. Run
+    study.optimize(objective, n_trials=total_trials)
 
     print(">>> SWEEP COMPLETE")
     print("Best params:", study.best_params)

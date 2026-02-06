@@ -4,15 +4,18 @@ import optuna
 import wandb
 import numpy as np
 from omegaconf import OmegaConf
+from sklearn.model_selection import ParameterGrid  # <--- Added for Grid Generation
 
 # Import your existing project modules
 from dpp_core import FeatureExtractor, get_strategy, DPPGenerator
 from dpp_gen import load_model
-from utils import calculate_diversity_score, calculate_pass_at_k
+from utils import calculate_diversity_score
 import re
 from datasets import load_dataset
 from sentence_transformers import SentenceTransformer
 
+
+# ... [Keep your regex helper functions here: extract_answer_num, extract_gold_num] ...
 
 def extract_answer_num(text):
     try:
@@ -47,37 +50,20 @@ dataset = load_dataset("gsm8k", "main", split="test")
 # OPTUNA OBJECTIVE
 # -------------------------------------------------------------------
 def objective(trial):
-    # strategy_name = trial.suggest_categorical("strategy.name", [
-    #     # "random_probe", "gram_schmidt",
-    #     "orthogonal_projection",
-    #     "joint"  # "sequential_subtraction"
-    # ])
+    strategy_alpha = trial.suggest_categorical("strategy.alpha", [2.0, 8.0, 16.0, 32.0, 64.0, 128.0])
+    temperature = trial.suggest_categorical("temperature", [0.0, 0.5, 1.0, 1.5, 2.0])
+    batch_size = trial.suggest_categorical("batch_size", [8, 4, 2])
 
-    strategy_name = "baseline"
-
-    # strategy_alpha = trial.suggest_float("strategy.alpha", 0.1, 100.0)
-    strategy_alpha = 0.0
-
-    # strategy_quality = trial.suggest_float("strategy.quality_scale", 0.1, 2.0)
+    strategy_name = "orthogonal_projection"
     strategy_quality = 1.0
-
-    # strategy_target = trial.suggest_categorical("strategy.target", ["logits", "embeddings"])
-    # strategy_pool = trial.suggest_categorical("strategy.pool", ["max", "mean", "positional"])
-
     strategy_target = "logits"
     strategy_pool = "max"
-
-    temperature = trial.suggest_float("temperature", 0.0, 1.5)
-
-    # ignore_pad = trial.suggest_categorical("ignore_pad", [True, False])
     ignore_pad = False
 
     # Sweep Constants
-    batch_size = 8
-    n_problems = 300
+    n_problems = 200
     steps = 32
 
-    # 2. Merge Config
     cfg = base_cfg.copy()
     if "strategy" not in cfg: cfg.strategy = {}
     cfg.strategy.name = strategy_name
@@ -90,21 +76,19 @@ def objective(trial):
     cfg.steps = steps
     cfg.ignore_pad = ignore_pad
 
-    # 3. Init W&B Run
-    run_name = f"trial_{trial.number}_{strategy_name}"
+    run_name = f"trial_{trial.number}_alpha{strategy_alpha}_temp{temperature}"
     run = wandb.init(
-        project="gsm8k_sweep",
-        group="tpe_l64",
+        project="gsm8k_eval",
+        group="grid_search_v1",
         name=run_name,
         config=OmegaConf.to_container(cfg, resolve=True),
         reinit=True
     )
 
-    # 4. Init Results Table
     results_table = wandb.Table(columns=["question", "gold", "generated", "is_correct", "diversity"])
 
     try:
-        print(f"\n>>> STARTING TRIAL {trial.number}: {strategy_name} (alpha={strategy_alpha:.2f})")
+        print(f"\n>>> STARTING TRIAL {trial.number}: Alpha={strategy_alpha}, Temp={temperature}")
 
         # Prepare Strategy
         feature_extractor = FeatureExtractor(
@@ -112,8 +96,8 @@ def objective(trial):
             kernel_target=cfg.strategy.target,
             pooling_method=cfg.strategy.pool,
             top_k=cfg.strategy.get("top_k", 0),
-            use_confidence_weighting=cfg.get('use_confidence_weighting', True),
-            ignore_token_ids=[tokenizer.pad_token_id] if cfg.get('ignore_pad',False) else []
+            # use_confidence_weighting=True, # Restore if using confidence
+            # ignore_token_ids=[tokenizer.pad_token_id] # Restore if using PAD masking
         )
 
         dpp_strategy = get_strategy(
@@ -128,8 +112,7 @@ def objective(trial):
         pass_k_list = []
         diversity_scores = []
 
-        # Limit problems if needed
-        problem_indices = range(min(n_problems, len(dataset)))
+        problem_indices = range(len(dataset)) if n_problems == -1 else range(min(n_problems, len(dataset)))
 
         for i in problem_indices:
             row = dataset[i]
@@ -137,12 +120,7 @@ def objective(trial):
             gold = extract_gold_num(row['answer'])
             if gold is None: continue
 
-            # --- RESTORED PRINT: Problem Header ---
-            print(f"\n--- Problem {i + 1} (Gold: {gold}) ---")
-
             formatted_prompt = f"Question: {q}\nLet's think step by step.\nAnswer:"
-
-            start_t = time.time()
 
             # Generate
             _, samples = generator.generate(
@@ -161,7 +139,6 @@ def objective(trial):
                     correct_count += 1
 
             pk = 1 if correct_count > 0 else 0
-            # pk = calculate_pass_at_k(len(samples), correct_count, cfg.batch_size)
             div = calculate_diversity_score(eval_model, samples)
 
             pass_k_list.append(pk)
@@ -176,26 +153,24 @@ def objective(trial):
             for sample in samples[1:]:
                 results_table.add_data('', gold, sample, is_correct_batch, div)
 
+            # Report intermediate progress
             wandb.log({
                 "problem_idx": i,
                 "pass_k_sample": pk,
                 "diversity_sample": div,
-                "batch_correct": correct_count
+                "batch_correct": correct_count,
+                "int_passk": np.mean(pass_k_list)
             })
 
             trial.report(np.mean(pass_k_list), i)
-            if trial.should_prune(): raise optuna.TrialPruned()
+
+            # if trial.should_prune(): raise optuna.TrialPruned()
 
         avg_pass_k = np.mean(pass_k_list) if pass_k_list else 0.0
         avg_div = np.mean(diversity_scores) if diversity_scores else 0.0
 
-        # --- RESTORED PRINT: Final Results Block ---
-        print("\n" + "=" * 60)
-        print(
-            f"RESULTS (Trial {trial.number}): Pass@{cfg.batch_size}: {avg_pass_k * 100:.1f}% | Avg Diversity: {avg_div:.3f}")
-        print("=" * 60)
+        print(f"RESULTS (Trial {trial.number}): Pass@K: {avg_pass_k:.4f} | Diversity: {avg_div:.4f}")
 
-        # Log final table and metrics
         wandb.log({
             "pass_k": avg_pass_k,
             "avg_diversity": avg_div,
@@ -211,25 +186,43 @@ def objective(trial):
 if __name__ == "__main__":
     storage_url = "postgresql://optuna_user:secure_password@127.0.0.1:5432/optuna"
 
+    # 1. Define the Grid Explicitly
+    # keys must match the `trial.suggest_categorical` names in objective()
+    search_space = {
+        "strategy.alpha": [2.0, 8.0, 16.0, 32.0, 64.0, 128.0],
+        "temperature": [0.0, 0.5, 1.0, 1.5, 2.0],
+        "batch_size": [8,4,2]
+    }
+
+    # 2. Define Repeats
+    n_repeats = 8
+
+    # 3. Create Study
+    # Note: We use the default sampler (TPE) because we are forcing the trials via enqueue.
     study = optuna.create_study(
-        study_name="gsm8k_baseline",
-        storage=storage_url,  # <--- Updated
+        study_name="gsm8k_eval",  # Unique name for this experiment
+        storage=storage_url,
         load_if_exists=True,
-        direction="maximize",
-        sampler=optuna.samplers.TPESampler(n_startup_trials=50),
-        pruner=optuna.pruners.HyperbandPruner(
-            min_resource=100,  # Don't prune before step 10 (Critical for stability!)
-            reduction_factor=2
-        )
+        direction="maximize"
     )
 
-    # study = optuna.create_study(
-    #     direction="maximize",
-    #     sampler=optuna.samplers.TPESampler(seed=42)
-    # )
+    print(f">>> Generatng Grid for {n_repeats} sweeps...")
 
-    print(">>> STARTING OPTUNA SWEEP")
-    study.optimize(objective)  # , n_trials=50)
+    # 4. Enqueue Trials in Order
+    # We generate the list of parameters and add them to the study queue.
+    # Optuna will consume this queue first before sampling anything new.
+    grid_list = list(ParameterGrid(search_space))
+
+    for r in range(n_repeats):
+        print(f"  > Queueing Sweep {r + 1}/{n_repeats} ({len(grid_list)} trials)...")
+        for params in grid_list:
+            study.enqueue_trial(params)
+
+    total_trials = len(grid_list) * n_repeats
+    print(f">>> Starting Optimization: {total_trials} total trials scheduled.")
+
+    # 5. Run
+    study.optimize(objective, n_trials=total_trials)
 
     print(">>> SWEEP COMPLETE")
     print("Best params:", study.best_params)
