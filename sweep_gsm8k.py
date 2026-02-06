@@ -201,7 +201,7 @@ if __name__ == "__main__":
     # 3. Create Study
     # Note: We use the default sampler (TPE) because we are forcing the trials via enqueue.
     study = optuna.create_study(
-        study_name="gsm8k_eval_2",  # Unique name for this experiment
+        study_name="gsm8k_eval_v3",  # Unique name for this experiment
         storage=storage_url,
         load_if_exists=True,
         direction="maximize"

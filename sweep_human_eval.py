@@ -199,7 +199,7 @@ if __name__ == "__main__":
 
     # 3. Create Study
     study = optuna.create_study(
-        study_name="humaneval_eval_2",  # Unique name for this experiment
+        study_name="humaneval_eval_v3",  # Unique name for this experiment
         storage=storage_url,
         load_if_exists=True,
         direction="maximize"
